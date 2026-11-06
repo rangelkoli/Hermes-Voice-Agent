@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import time
 from datetime import datetime
 from multiprocessing import resource_tracker
 
@@ -16,7 +17,7 @@ from hermes_voice.stt import Transcriber
 from hermes_voice.wake import WakeError, WakeGate, WakeSpotter, ensure_model, model_is_cached
 
 _HEALTH_URL = "http://127.0.0.1:8642/health"
-_GATEWAY = "Hermes is not running. Start it with: hermes gateway"
+_HEALTH_ATTEMPTS = 3
 
 
 def _device(value: str) -> int | str:
@@ -31,6 +32,28 @@ def _end_silence_ms(value: str) -> int:
     if number <= 0:
         raise argparse.ArgumentTypeError("--end-silence-ms must be greater than 0")
     return number
+
+
+def _check_hermes() -> None:
+    """Exit only if nothing is listening. A busy gateway is fine: the app retries sends."""
+    for attempt in range(_HEALTH_ATTEMPTS):
+        try:
+            httpx.get(_HEALTH_URL, timeout=3, trust_env=False)
+            return
+        except httpx.ConnectError as exc:
+            reason = exc
+        except httpx.HTTPError:
+            return
+        if attempt + 1 < _HEALTH_ATTEMPTS:
+            time.sleep(1)
+    print(
+        f"Nothing is answering at {_HEALTH_URL} ({reason}).\n"
+        "Start Hermes with: hermes gateway\n"
+        "If it is already running, check API_SERVER_ENABLED=true and API_SERVER_PORT=8642 "
+        "in its .env.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -68,11 +91,7 @@ def main(argv: list[str] | None = None) -> None:
         print(exc, file=sys.stderr)
         raise SystemExit(1) from None
 
-    try:
-        httpx.get(_HEALTH_URL, timeout=3, trust_env=False).raise_for_status()
-    except httpx.HTTPError:
-        print(_GATEWAY, file=sys.stderr)
-        raise SystemExit(1) from None
+    _check_hermes()
 
     vad = webrtcvad.Vad(args.vad_level)
     is_speech = lambda f: vad.is_speech(f, SAMPLE_RATE)

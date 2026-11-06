@@ -11,19 +11,24 @@ import webrtcvad
 from hermes_voice.__main__ import main
 from hermes_voice.audio import FRAME_BYTES, SAMPLE_RATE
 
-_GATEWAY = "Hermes is not running. Start it with: hermes gateway"
 
 
 def _silence_health(monkeypatch, status=200):
-    seen = {}
+    seen = {"count": 0}
+    answers = status if isinstance(status, list) else None
 
     def get(url, timeout=None, **kwargs):
         seen["call"] = (url, timeout, kwargs)
-        if status == "connect":
+        seen["count"] += 1
+        answer = answers.pop(0) if answers else status
+        if answer == "connect":
             raise httpx.ConnectError("refused")
-        return httpx.Response(status, request=httpx.Request("GET", url))
+        if answer == "timeout":
+            raise httpx.ReadTimeout("slow")
+        return httpx.Response(answer, request=httpx.Request("GET", url))
 
     monkeypatch.setattr("hermes_voice.__main__.httpx.get", get)
+    monkeypatch.setattr("hermes_voice.__main__.time.sleep", lambda _s: None)
     return seen
 
 
@@ -133,19 +138,43 @@ def test_missing_key_exits_1_without_traceback(monkeypatch, capsys, tmp_path):
     assert "call" not in called
 
 
-@pytest.mark.parametrize("status", ["connect", 503])
-def test_health_failure_exits_1_with_gateway_message(monkeypatch, capsys, tmp_path, status):
-    _ready(monkeypatch, tmp_path, health=status)
+def test_refused_connection_retries_then_exits_1_with_the_fix(monkeypatch, capsys, tmp_path):
+    seen = _ready(monkeypatch, tmp_path, health="connect")
 
     with pytest.raises(SystemExit) as exc:
         main([])
 
     assert exc.value.code == 1
+    assert seen["count"] == 3
     captured = capsys.readouterr()
     text = captured.out + captured.err
-    assert _GATEWAY in text
+    assert "hermes gateway" in text
+    assert "API_SERVER_ENABLED" in text
+    assert "refused" in text
     assert "Traceback" not in text
     assert "test-key" not in text
+
+
+def test_refused_once_then_up_starts_the_app(monkeypatch, tmp_path):
+    seen = _ready(monkeypatch, tmp_path, health=["connect", 200])
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
+
+    main([])
+
+    assert seen["count"] == 2
+    assert "app" in found
+
+
+@pytest.mark.parametrize("answer", ["timeout", 503])
+def test_busy_hermes_does_not_block_startup(monkeypatch, tmp_path, answer):
+    # The gateway is there but slow. The app already retries sends, so opening it is safe.
+    seen = _ready(monkeypatch, tmp_path, health=answer)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
+
+    main([])
+
+    assert seen["count"] == 1
+    assert "app" in found
 
 
 def test_default_flags_reach_constructors(monkeypatch, tmp_path):
