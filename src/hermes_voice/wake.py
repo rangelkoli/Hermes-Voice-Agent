@@ -109,13 +109,20 @@ def _install_model(
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     if digest != MODEL_SHA256:
         raise WakeError(_HASH_ERROR)
+    staging = directory / f".wake-unpack-{uuid.uuid4().hex}"
+    staging.mkdir()
     try:
         with tarfile.open(archive, "r:bz2") as tar:
-            tar.extractall(directory, filter="data")
+            tar.extractall(staging, filter="data")
     except Exception as exc:
         raise WakeError(_UNPACK_ERROR) from exc
-    if not (model / "tokens.txt").is_file():
+    extracted = staging / MODEL_DIR
+    if not (extracted / "tokens.txt").is_file():
         raise WakeError(_UNPACK_ERROR)
+    if model.exists():
+        shutil.rmtree(model)
+    extracted.replace(model)
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 class WakeSpotter:

@@ -265,13 +265,14 @@ class VoiceApp(App[None]):
         self.status = status
 
     def _close_gate(self) -> None:
-        """Caller holds _audio_lock. Drop the wake and any partial utterance."""
+        """Caller holds _audio_lock. Drop the wake, partial speech, and queued audio."""
         if self.gate is None:
             return
         self.gate.sleep()
         if self.segmenter is not None:
             self.segmenter.reset()
         self._hearing = False
+        self._drop_waiting_audio()
 
     def _gate_busy(self) -> bool:
         # A result stays busy until the UI accepts or drops it. A frame in that
@@ -463,6 +464,11 @@ class VoiceApp(App[None]):
             if self._stop_audio.is_set():
                 break
             with self._audio_lock:
+                # A closed gate or a mute must not send audio that was already queued.
+                if generation != self._mute_gen or (
+                    self.gate is not None and not self.gate.awake
+                ):
+                    continue
                 self._transcribing = True
             self._on_ui(self._sync_status)
             failed = False
@@ -543,7 +549,8 @@ class VoiceApp(App[None]):
                 spoken = strip_wake(text, self.wake or "")
                 if not spoken or is_noise(spoken):
                     return
-                self.gate.sleep()
+                self._close_gate()
+            self._sync_status()
         log = self.query_one("#log", RichLog)
         if log.lines:
             log.write(Text())
@@ -801,11 +808,7 @@ class VoiceApp(App[None]):
                 if self._stop_audio.is_set() or self._stop_speech.is_set():
                     self._speech_waiting = False
                     return False
-                if (
-                    self.segmenter is not None
-                    and self.segmenter.in_speech
-                    and time.monotonic() < deadline
-                ):
+                if self._gate_busy() and time.monotonic() < deadline:
                     continue
                 self._speaking = True
                 self._speech_waiting = False
@@ -835,7 +838,7 @@ class VoiceApp(App[None]):
         while not self._stop_audio.is_set():
             if self._stop_speech.is_set():
                 return False
-            if self.segmenter is None or not self.segmenter.in_speech:
+            if not self._gate_busy():
                 return True
             if time.monotonic() >= deadline:
                 return True

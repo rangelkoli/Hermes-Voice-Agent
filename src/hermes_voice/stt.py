@@ -40,6 +40,7 @@ def strip_wake(text: str, phrase: str) -> str:
         pattern = rf"(?:{words[0]}\W+)?{body}"
     else:
         pattern = r"\W+".join(words)
+    pattern = rf"\b(?:{pattern})\b"
     matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
     if not matches:
         return text

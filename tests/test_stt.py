@@ -19,6 +19,8 @@ def test_real_requests_are_kept(text):
     ("open the logs", "open the logs"),
     ("Hey Hermes.", ""),
     ("hey hermes stop hey hermes go", "go"),
+    ("Hey Hermes, check hermeneutics", "check hermeneutics"),
+    ("Hey Hermes, open the hermescope", "open the hermescope"),
 ])
 def test_strip_wake(text, expected):
     assert strip_wake(text, "hey hermes") == expected

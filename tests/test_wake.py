@@ -199,3 +199,31 @@ def test_archive_with_unsafe_path_is_rejected(tmp_path, monkeypatch):
     assert "--open-mic" in str(exc.value)
     assert not (tmp_path.parent / "escaped-wake-word.txt").exists()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_failed_unpack_after_tokens_txt_leaves_no_final_model_directory(tmp_path, monkeypatch):
+    # ignore_errors can leave a partial tree; deleting the final directory is a no-op here.
+    payload = _archive({f"{MODEL_DIR}/tokens.txt": b"tok\n"})
+    monkeypatch.setattr(
+        "hermes_voice.wake.MODEL_SHA256",
+        hashlib.sha256(payload).hexdigest(),
+    )
+
+    def extractall(self, path, *args, **kwargs):
+        del self, args, kwargs
+        partial = Path(path) / MODEL_DIR
+        partial.mkdir(parents=True, exist_ok=True)
+        (partial / "tokens.txt").write_text("partial", encoding="utf-8")
+        raise OSError("unpack stopped after tokens.txt")
+
+    monkeypatch.setattr(tarfile.TarFile, "extractall", extractall)
+    monkeypatch.setattr("hermes_voice.wake.shutil.rmtree", lambda *_args, **_kwargs: None)
+
+    def download(url, dest):
+        del url
+        Path(dest).write_bytes(payload)
+
+    with pytest.raises(WakeError) as exc:
+        ensure_model(tmp_path, download)
+    assert "--open-mic" in str(exc.value)
+    assert not (tmp_path / MODEL_DIR).exists()

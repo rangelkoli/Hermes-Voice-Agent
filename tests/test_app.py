@@ -1584,3 +1584,132 @@ def test_finished_reply_is_labelled_and_turns_are_separated():
             assert "" in lines[2:lines.index("You  second")]
 
     run(go)
+
+
+class _RecordingTranscriber:
+    """Records each utterance. Holds the first call so a later one can sit in the queue."""
+
+    def __init__(self, texts):
+        self._texts = list(texts)
+        self.heard: list[bytes] = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def load(self) -> None:
+        return None
+
+    def transcribe(self, pcm: bytes) -> str:
+        self.heard.append(pcm)
+        self.entered.set()
+        if len(self.heard) == 1:
+            self.release.wait(3)
+        if not self._texts:
+            return ""
+        return self._texts.pop(0)
+
+
+def test_utterance_queued_behind_an_accepted_command_is_not_transcribed():
+    async def go():
+        heard = _RecordingTranscriber(["Hey Hermes, open the logs", "what is the weather"])
+        gate = WakeGate(_Spotter(hit=True))
+        gate.feed(b"wake")
+        mic = FakeMic()
+        c = FakeClient()
+        app = VoiceApp(
+            c,
+            "voice-test",
+            wake="hey hermes",
+            gate=gate,
+            mic=mic,
+            transcriber=heard,
+            segmenter=_IdleSegmenter(),
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            await until(lambda: mic.starts >= 1)
+            app._utterances.put((b"first", 0))
+            app._utterances.put((b"second", 0))
+            try:
+                await until(lambda: heard.heard == [b"first"] and app._utterances.qsize() == 1)
+                heard.release.set()
+                await until(lambda: c.started == ["open the logs"])
+                await asyncio.sleep(0.35)
+                assert heard.heard == [b"first"]
+            finally:
+                heard.release.set()
+    run(go)
+
+
+def test_reply_during_wake_transcription_plays_after_the_command_is_sent():
+    async def go():
+        heard = _RecordingTranscriber(["Hey Hermes, open the logs"])
+        gate = WakeGate(_Spotter(hit=True))
+        gate.feed(b"wake")
+        speaker = FakeSpeaker()
+        mic = FakeMic()
+        c = FakeClient()
+        app = VoiceApp(
+            c,
+            "voice-test",
+            wake="hey hermes",
+            gate=gate,
+            mic=mic,
+            transcriber=heard,
+            segmenter=_IdleSegmenter(),
+            speaker=speaker,
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            await until(lambda: mic.starts >= 1)
+            app._utterances.put((b"command-audio", 0))
+            try:
+                await until(lambda: heard.entered.is_set())
+                app._speech.put("Ready.")
+                await until(lambda: app._speech_waiting or speaker.spoke or not gate.awake)
+                assert gate.awake is True
+                assert speaker.spoke == []
+                assert c.started == []
+                heard.release.set()
+                await until(lambda: c.started == ["open the logs"] and speaker.spoke == ["Ready."])
+            finally:
+                heard.release.set()
+    run(go)
+
+
+def test_accepted_command_returns_to_waiting_and_the_reply_plays_promptly():
+    class Stuck:
+        def __init__(self):
+            self.in_speech = True
+
+        def push(self, frame):
+            del frame
+            return None
+
+        def reset(self):
+            self.in_speech = False
+
+    async def go():
+        segmenter = Stuck()
+        speaker = FakeSpeaker()
+        c = FakeClient(script=[RunEvent("run.completed", {"output": "Ready."})])
+        gate = WakeGate(_Spotter(hit=True))
+        gate.feed(b"wake")
+        app = VoiceApp(
+            c,
+            "voice-test",
+            wake="hey hermes",
+            gate=gate,
+            segmenter=segmenter,
+            speaker=speaker,
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            app._hearing = True
+            app._sync_status()
+            assert app.status == "hearing"
+            app.on_transcript("Hey Hermes, open the logs")
+            assert app.status == "waiting"
+            assert segmenter.in_speech is False
+            await until(lambda: speaker.spoke == ["Ready."], timeout=2)
+            assert c.started == ["open the logs"]
+    run(go)
