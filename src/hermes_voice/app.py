@@ -37,6 +37,7 @@ def _status_class(status: str) -> str:
 class VoiceApp(App[None]):
     """Conversation screen for one Hermes session."""
 
+    TITLE = "Hermes Voice"
     ENABLE_COMMAND_PALETTE = False
     ESCAPE_TO_MINIMIZE = False
 
@@ -78,11 +79,18 @@ class VoiceApp(App[None]):
     }
     #log {
         height: 1fr;
+        padding: 0 1;
         border-top: solid $primary;
+        background: $surface;
+        scrollbar-size-vertical: 1;
+        scrollbar-background: $surface;
+        scrollbar-color: $primary;
     }
     #stream {
-        height: 1;
+        height: auto;
+        max-height: 6;
         padding: 0 1;
+        color: #5fd0e0;
     }
     .status-loading {
         color: #8a8a8a;
@@ -168,7 +176,7 @@ class VoiceApp(App[None]):
             yield Static("● LISTENING", id="status", classes="status-listening")
             yield Static(device, id="device")
         yield Sparkline(id="meter")
-        yield RichLog(id="log", markup=False, highlight=False, wrap=True)
+        yield RichLog(id="log", markup=False, highlight=False, wrap=True, min_width=20)
         yield Static("", id="stream", markup=False)
         yield Footer()
 
@@ -423,7 +431,10 @@ class VoiceApp(App[None]):
         spoken = apply_wake(text, self.wake)
         if spoken is None or is_noise(spoken):
             return
-        self.log_line(f"You  {spoken}")
+        log = self.query_one("#log", RichLog)
+        if log.lines:
+            log.write(Text())
+        log.write(Text.assemble(("You", "bold #3dde7a"), f"  {spoken}"))
         self._pending.append(spoken)
         if self._run_id is None:
             self._ensure_send()
@@ -493,7 +504,8 @@ class VoiceApp(App[None]):
         data = event.data
         if name == "message.delta":
             self._reply += str(data.get("delta", ""))
-            self.query_one("#stream", Static).update(f"Hermes  {self._reply}")
+            # ponytail: shows the newest text only; the full reply lands in the log when done
+            self.query_one("#stream", Static).update(f"Hermes  {self._reply[-400:]}")
         elif name in ("tool.started", "tool.completed"):
             self._write_tool(data)
         elif name == "approval.request":
@@ -502,7 +514,9 @@ class VoiceApp(App[None]):
             self.bell()
         elif name == "run.completed":
             output = data.get("output", "")
-            self.query_one("#log", RichLog).write(Markdown("" if output is None else str(output)))
+            log = self.query_one("#log", RichLog)
+            log.write(Text("Hermes", style="bold #5fd0e0"))
+            log.write(Markdown("" if output is None else str(output)))
             self._clear_reply()
         elif name == "run.failed":
             self.log_line(str(data.get("error", "The run failed.")))
@@ -521,13 +535,13 @@ class VoiceApp(App[None]):
 
     def _write_tool(self, data: dict) -> None:
         parts = [str(data.get("tool", ""))]
-        preview = data.get("preview")
-        if preview:
-            parts.append(str(preview))
-        if data.get("duration") is not None:
-            parts.append(str(data["duration"]))
+        duration = data.get("duration")
+        if duration is None:
+            parts.append(str(data.get("preview") or ""))
+        else:
+            parts.append(f"{duration}s")
         if data.get("error"):
-            parts.append(str(data["error"]))
+            parts += ["failed", str(data.get("preview") or "")]
         line = "  ".join(part for part in parts if part)
         self.query_one("#log", RichLog).write(Text(f"⚙ {line}", style="dim"))
 

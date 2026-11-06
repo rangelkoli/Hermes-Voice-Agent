@@ -759,3 +759,19 @@ def test_cancelled_ui_callback_does_not_raise():
             app._on_ui(app.log_line, "still shutting down")
             assert app.is_running
     run(go)
+
+
+def test_finished_reply_is_labelled_and_turns_are_separated():
+    async def go():
+        c = FakeClient(script=[RunEvent("run.completed", {"output": "Done."})])
+        app = VoiceApp(c, "voice-test")
+        async with app.run_test() as pilot:
+            app.on_transcript("first")
+            await pilot.pause()
+            app.on_transcript("second")
+            await pilot.pause()
+            lines = [strip.text.strip() for strip in app.query_one("#log", RichLog).lines]
+            assert lines[:2] == ["You  first", "Hermes"]
+            assert "" in lines[2:lines.index("You  second")]
+
+    run(go)
