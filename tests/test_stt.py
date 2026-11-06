@@ -1,6 +1,6 @@
 from types import SimpleNamespace as NS
 import pytest
-from hermes_voice.stt import apply_wake, is_noise, join_segments
+from hermes_voice.stt import is_noise, join_segments, strip_wake
 
 @pytest.mark.parametrize("text", ["", "  ", "Thank you.", "thanks for watching!", "you", "...", "[BLANK_AUDIO]", "(music)"])
 def test_whisper_noise_is_dropped(text):
@@ -10,21 +10,21 @@ def test_whisper_noise_is_dropped(text):
 def test_real_requests_are_kept(text):
     assert not is_noise(text)
 
-def test_no_wake_phrase_passes_everything():
-    assert apply_wake("open the logs", None) == "open the logs"
+@pytest.mark.parametrize("text,expected", [
+    ("Hey Hermes, open the logs", "open the logs"),
+    ("hey, hermes open the logs", "open the logs"),
+    ("HEY HERMES: open the logs", "open the logs"),
+    ("and then hey hermes open the logs", "open the logs"),
+    ("Hermes open the logs", "open the logs"),
+    ("open the logs", "open the logs"),
+    ("Hey Hermes.", ""),
+    ("hey hermes stop hey hermes go", "go"),
+])
+def test_strip_wake(text, expected):
+    assert strip_wake(text, "hey hermes") == expected
 
-@pytest.mark.parametrize("text", ["Hermes, open the logs", "hey hermes open the logs", "HERMES: open the logs"])
-def test_wake_phrase_is_stripped(text):
-    assert apply_wake(text, "hermes") == "open the logs"
-
-def test_speech_without_wake_phrase_is_ignored():
-    assert apply_wake("what's for dinner", "hermes") is None
-
-def test_wake_phrase_alone_is_ignored():
-    assert apply_wake("Hey Hermes.", "hermes") is None
-
-def test_hey_with_punctuation_is_a_wake_phrase():
-    assert apply_wake("hey, hermes open the logs", "hermes") == "open the logs"
+def test_strip_wake_with_a_custom_phrase():
+    assert strip_wake("Computer, lights on", "computer") == "lights on"
 
 def test_prompt_word_alone_is_noise():
     assert is_noise("Hermes.")

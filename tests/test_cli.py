@@ -36,7 +36,36 @@ def _ready(monkeypatch, tmp_path, *, health=200):
     return _silence_health(monkeypatch, health)
 
 
-def _capture_app(monkeypatch):
+def _stub_wake(monkeypatch, tmp_path):
+    model = tmp_path / "wake-model"
+    model.mkdir(exist_ok=True)
+    seen = {"ensure": 0, "phrase": None, "threshold": None, "model_dir": None}
+
+    def ensure_model(root=None, download=None):
+        seen["ensure"] += 1
+        seen["root"] = root
+        seen["download"] = download
+        return model
+
+    class Spotter:
+        def __init__(self, phrase, model_dir, threshold=0.25):
+            seen["phrase"] = phrase
+            seen["model_dir"] = model_dir
+            seen["threshold"] = threshold
+
+        def feed(self, frame):
+            del frame
+            return False
+
+        def reset(self):
+            return None
+
+    monkeypatch.setattr("hermes_voice.__main__.ensure_model", ensure_model, raising=False)
+    monkeypatch.setattr("hermes_voice.__main__.WakeSpotter", Spotter, raising=False)
+    return seen
+
+
+def _capture_app(monkeypatch, tmp_path):
     modes = []
     rates = []
 
@@ -56,6 +85,7 @@ def _capture_app(monkeypatch):
         found["app"] = self
 
     monkeypatch.setattr("hermes_voice.__main__.VoiceApp.run", run)
+    _stub_wake(monkeypatch, tmp_path)
     return found, modes, rates
 
 
@@ -120,7 +150,7 @@ def test_health_failure_exits_1_with_gateway_message(monkeypatch, capsys, tmp_pa
 
 def test_default_flags_reach_constructors(monkeypatch, tmp_path):
     seen = _ready(monkeypatch, tmp_path)
-    found, modes, rates = _capture_app(monkeypatch)
+    found, modes, rates = _capture_app(monkeypatch, tmp_path)
 
     main([])
 
@@ -129,7 +159,7 @@ def test_default_flags_reach_constructors(monkeypatch, tmp_path):
     assert app.segmenter._end_silence_ms == 1000
     assert app.transcriber.model == "gemini-3.5-transcribe"
     assert app.mic._device is None
-    assert app.wake is None
+    assert app.wake == "hey hermes"
     assert re.fullmatch(r"voice-\d{8}-\d{6}", app.session_id)
     assert seen["call"][0] == "http://127.0.0.1:8642/health"
     assert seen["call"][1] == 3
@@ -143,7 +173,7 @@ def test_default_flags_reach_constructors(monkeypatch, tmp_path):
 
 def test_device_name_reaches_the_mic(monkeypatch, tmp_path):
     _ready(monkeypatch, tmp_path)
-    found, _modes, _rates = _capture_app(monkeypatch)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
 
     main(["--device", "hw:1,0"])
 
@@ -152,7 +182,7 @@ def test_device_name_reaches_the_mic(monkeypatch, tmp_path):
 
 def test_explicit_flags_reach_constructors(monkeypatch, tmp_path):
     _ready(monkeypatch, tmp_path)
-    found, modes, rates = _capture_app(monkeypatch)
+    found, modes, rates = _capture_app(monkeypatch, tmp_path)
 
     main([
         "--wake", "hermes",
@@ -175,7 +205,7 @@ def test_explicit_flags_reach_constructors(monkeypatch, tmp_path):
 def test_health_check_ignores_http_proxy(monkeypatch, tmp_path):
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
     seen = _ready(monkeypatch, tmp_path)
-    found, _modes, _rates = _capture_app(monkeypatch)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
 
     main([])
 
@@ -186,7 +216,7 @@ def test_health_check_ignores_http_proxy(monkeypatch, tmp_path):
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_end_silence_must_be_positive(monkeypatch, tmp_path, value):
     _ready(monkeypatch, tmp_path)
-    _capture_app(monkeypatch)
+    _capture_app(monkeypatch, tmp_path)
 
     with pytest.raises(SystemExit) as exc:
         main(["--end-silence-ms", value])
@@ -206,9 +236,19 @@ def run_inside_textual(self):
             multiprocessing.RLock()  # what tqdm does while Whisper loads
     asyncio.run(go())
 
+class _Spotter:
+    def __init__(self, phrase, model_dir, threshold=0.25):
+        pass
+    def feed(self, frame):
+        return False
+    def reset(self):
+        pass
+
 cli.Mic.check = lambda self: None
 cli.httpx.get = lambda *a, **k: httpx.Response(200, request=httpx.Request("GET", "http://x"))
 cli.VoiceApp.run = run_inside_textual
+cli.ensure_model = lambda root=None, download=None: __import__("pathlib").Path(".")
+cli.WakeSpotter = _Spotter
 sys.argv = ["hermes-voice"]
 cli.main()
 """
@@ -218,7 +258,7 @@ def test_default_mode_builds_gemini_clients(monkeypatch, tmp_path):
     from hermes_voice.gemini import GeminiSpeaker, GeminiTranscriber
 
     _ready(monkeypatch, tmp_path)
-    found, _modes, _rates = _capture_app(monkeypatch)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
 
     main([])
 
@@ -241,7 +281,7 @@ def test_local_uses_whisper_and_no_speaker_and_needs_no_key(monkeypatch, tmp_pat
     monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
     _ready(monkeypatch, tmp_path)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    found, _modes, _rates = _capture_app(monkeypatch)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
 
     main(["--local"])
 
@@ -257,7 +297,7 @@ def test_missing_gemini_key_exits_1_with_the_message(monkeypatch, capsys, tmp_pa
     monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
     _ready(monkeypatch, tmp_path)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    _capture_app(monkeypatch)
+    _capture_app(monkeypatch, tmp_path)
 
     with pytest.raises(SystemExit) as exc:
         main([])
@@ -274,7 +314,7 @@ def test_missing_gemini_key_exits_1_with_the_message(monkeypatch, capsys, tmp_pa
 
 def test_voice_and_model_flags_reach_the_speaker(monkeypatch, tmp_path):
     _ready(monkeypatch, tmp_path)
-    found, _modes, _rates = _capture_app(monkeypatch)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
 
     main([
         "--tts-model", "gemini-custom-tts",
@@ -295,3 +335,81 @@ def test_multiprocessing_lock_works_inside_the_ui():
         [sys.executable, "-c", _LOCK_INSIDE_UI], env=env, capture_output=True, text=True, timeout=60
     )
     assert done.returncode == 0, done.stderr[-500:]
+
+
+def test_default_builds_a_gate_for_hey_hermes(monkeypatch, capsys, tmp_path):
+    from hermes_voice.wake import MODEL_DIR, WakeGate
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _ready(monkeypatch, tmp_path)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
+    seen = _stub_wake(monkeypatch, tmp_path)
+
+    main([])
+
+    out = capsys.readouterr().out
+    assert "Preparing the wake word model..." in out
+    app = found["app"]
+    assert app.wake == "hey hermes"
+    assert isinstance(app.gate, WakeGate)
+    assert seen["phrase"] == "hey hermes"
+    assert seen["threshold"] == 0.25
+    assert seen["ensure"] == 1
+
+    cached = tmp_path / "cache" / "hermes-voice" / "wake" / MODEL_DIR
+    cached.mkdir(parents=True)
+    (cached / "tokens.txt").write_text("tok", encoding="utf-8")
+    main([])
+    assert "Preparing the wake word model..." not in capsys.readouterr().out
+
+
+def test_wake_flag_and_threshold_reach_the_spotter(monkeypatch, tmp_path):
+    _ready(monkeypatch, tmp_path)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
+    seen = _stub_wake(monkeypatch, tmp_path)
+
+    main(["--wake", "computer", "--wake-threshold", "0.4"])
+
+    app = found["app"]
+    assert app.wake == "computer"
+    assert seen["phrase"] == "computer"
+    assert seen["threshold"] == 0.4
+    assert seen["model_dir"] == tmp_path / "wake-model"
+    assert app.gate is not None
+
+
+def test_open_mic_builds_no_gate_and_downloads_no_model(monkeypatch, capsys, tmp_path):
+    _ready(monkeypatch, tmp_path)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
+    seen = _stub_wake(monkeypatch, tmp_path)
+
+    main(["--open-mic"])
+
+    app = found["app"]
+    assert app.gate is None
+    assert app.wake is None
+    assert seen["ensure"] == 0
+    assert "Preparing the wake word model..." not in capsys.readouterr().out
+
+
+def test_model_failure_exits_1_with_the_message(monkeypatch, capsys, tmp_path):
+    from hermes_voice.wake import WakeError
+
+    _ready(monkeypatch, tmp_path)
+    found, _modes, _rates = _capture_app(monkeypatch, tmp_path)
+    message = "The wake word model could not be prepared. Run with --open-mic, which needs no model."
+
+    def boom(root=None, download=None):
+        del root, download
+        raise WakeError(message)
+
+    monkeypatch.setattr("hermes_voice.__main__.ensure_model", boom)
+
+    with pytest.raises(SystemExit) as exc:
+        main([])
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert message in captured.err
+    assert "Traceback" not in captured.err
+    assert "app" not in found

@@ -13,6 +13,7 @@ from hermes_voice.audio import SAMPLE_RATE, Mic, MicError, Segmenter, list_devic
 from hermes_voice.gemini import GeminiError, GeminiSpeaker, GeminiTranscriber, load_gemini_key
 from hermes_voice.hermes import HermesAuthError, HermesClient, load_api_key
 from hermes_voice.stt import Transcriber
+from hermes_voice.wake import WakeError, WakeGate, WakeSpotter, ensure_model, model_is_cached
 
 _HEALTH_URL = "http://127.0.0.1:8642/health"
 _GATEWAY = "Hermes is not running. Start it with: hermes gateway"
@@ -34,7 +35,9 @@ def _end_silence_ms(value: str) -> int:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="hermes-voice")
-    parser.add_argument("--wake")
+    parser.add_argument("--wake", default="hey hermes")
+    parser.add_argument("--open-mic", action="store_true")
+    parser.add_argument("--wake-threshold", type=float, default=0.25)
     parser.add_argument("--device", type=_device)
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--local", action="store_true")
@@ -86,6 +89,19 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(1) from None
         transcriber = GeminiTranscriber(gemini_key, model=stt_model)
         speaker = GeminiSpeaker(gemini_key, model=args.tts_model, voice=args.voice)
+    if args.open_mic:
+        gate = None
+        wake = None
+    else:
+        if not model_is_cached():
+            print("Preparing the wake word model...")
+        try:
+            model_dir = ensure_model()
+        except WakeError as exc:
+            print(exc, file=sys.stderr)
+            raise SystemExit(1) from None
+        gate = WakeGate(WakeSpotter(args.wake, model_dir, args.wake_threshold))
+        wake = args.wake
     # Textual replaces sys.stderr with an object whose fileno() is -1. Loading Whisper makes
     # tqdm start this tracker, which passes that fd to its child and fails with "bad value(s)
     # in fds_to_keep". Starting it here, while stderr is real, avoids that.
@@ -93,9 +109,10 @@ def main(argv: list[str] | None = None) -> None:
     VoiceApp(
         HermesClient(api_key),
         datetime.now().strftime("voice-%Y%m%d-%H%M%S"),
-        wake=args.wake,
+        wake=wake,
         mic=Mic(args.device),
         transcriber=transcriber,
         segmenter=Segmenter(is_speech, end_silence_ms=args.end_silence_ms),
         speaker=speaker,
+        gate=gate,
     ).run()

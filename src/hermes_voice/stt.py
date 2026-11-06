@@ -26,18 +26,25 @@ def is_noise(text: str) -> bool:
     return normalized in _NOISE
 
 
-def apply_wake(text: str, wake: str | None) -> str | None:
-    if wake is None:
+def strip_wake(text: str, phrase: str) -> str:
+    """Return the words after the last time the phrase appears.
+
+    A phrase that starts with "hey" still matches when that word was dropped.
+    No match leaves the text as it is: the detector already heard the phrase.
+    """
+    words = [re.escape(word) for word in phrase.split()]
+    if not words:
         return text
-    match = re.match(
-        rf"^\W*(?:hey\W+)?{re.escape(wake)}\b\W*",
-        text,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    remainder = text[match.end() :].strip()
-    return remainder or None
+    if phrase.lower().startswith("hey ") and len(words) > 1:
+        body = r"\W+".join(words[1:])
+        pattern = rf"(?:{words[0]}\W+)?{body}"
+    else:
+        pattern = r"\W+".join(words)
+    matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
+    if not matches:
+        return text
+    remainder = text[matches[-1].end() :]
+    return remainder.strip(string.punctuation + string.whitespace)
 
 
 def join_segments(segments: Iterable) -> str:

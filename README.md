@@ -16,6 +16,8 @@ Create a Gemini API key at [aistudio.google.com/apikey](https://aistudio.google.
 uv run hermes-voice
 ```
 
+The wake phrase is required. Say "hey hermes", then the command. Change the phrase with `--wake "computer"`. `--open-mic` sends every utterance and does not use a wake phrase. `--wake-threshold` is how sure detection must be before the mic opens. The default is `0.25`. The first run downloads the on-device wake model.
+
 The Hermes key is read from `HERMES_API_KEY`. If that is unset, it is read from `API_SERVER_KEY` in `$HERMES_HOME/.env`, or `~/.hermes/.env` when `HERMES_HOME` is unset.
 
 `m` mutes the microphone. `esc` cuts speech, and a second press stops the current request. `q` quits.
@@ -24,7 +26,9 @@ The Hermes key is read from `HERMES_API_KEY`. If that is unset, it is read from 
 
 ## Flags
 
-- `--wake` sends speech only after this word.
+- `--wake` sets the wake phrase. Default `hey hermes`.
+- `--open-mic` sends every utterance and skips the wake model.
+- `--wake-threshold` is the detection threshold. Default `0.25`. Raise it when other words open the mic.
 - `--device` picks an input by index or name.
 - `--list-devices` prints input devices and exits.
 - `--local` transcribes with Whisper and does not speak replies.
@@ -36,4 +40,4 @@ The Hermes key is read from `HERMES_API_KEY`. If that is unset, it is read from 
 
 ## Privacy
 
-> By default, finished utterances are sent to Google for transcription, and reply text is sent to Google to be spoken. In open-mic mode that includes anything said in the room. Silence is never sent. Transcripts also go to Hermes and its model provider. With `--local`, nothing goes to Google and audio stays on this computer.
+> By default nothing leaves this computer until the wake phrase is heard. Detection runs on-device. After a wake, the command is sent to Google for transcription, along with up to 1.5 seconds of audio from just before the phrase ended. Reply text is sent to Google to be spoken. Transcripts also go to Hermes and its model provider. With `--open-mic`, every utterance is sent. With `--local`, nothing goes to Google.
