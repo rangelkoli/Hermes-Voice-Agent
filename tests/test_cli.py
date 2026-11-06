@@ -1,4 +1,6 @@
+import os
 import re
+import subprocess
 import sys
 from types import SimpleNamespace as NS
 
@@ -189,3 +191,32 @@ def test_end_silence_must_be_positive(monkeypatch, tmp_path, value):
         main(["--end-silence-ms", value])
 
     assert exc.value.code == 2
+
+
+_LOCK_INSIDE_UI = """
+import asyncio, multiprocessing, sys
+import httpx
+from textual.app import App
+from hermes_voice import __main__ as cli
+
+def run_inside_textual(self):
+    async def go():
+        async with App().run_test():
+            multiprocessing.RLock()  # what tqdm does while Whisper loads
+    asyncio.run(go())
+
+cli.Mic.check = lambda self: None
+cli.httpx.get = lambda *a, **k: httpx.Response(200, request=httpx.Request("GET", "http://x"))
+cli.VoiceApp.run = run_inside_textual
+sys.argv = ["hermes-voice"]
+cli.main()
+"""
+
+
+def test_multiprocessing_lock_works_inside_the_ui():
+    # Needs a fresh process: the tracker is global, so an earlier test could hide the bug.
+    env = {**os.environ, "HERMES_API_KEY": "test-key"}
+    done = subprocess.run(
+        [sys.executable, "-c", _LOCK_INSIDE_UI], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert done.returncode == 0, done.stderr[-500:]

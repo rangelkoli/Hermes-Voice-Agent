@@ -3,6 +3,7 @@
 import argparse
 import sys
 from datetime import datetime
+from multiprocessing import resource_tracker
 
 import httpx
 import webrtcvad
@@ -68,6 +69,10 @@ def main(argv: list[str] | None = None) -> None:
 
     vad = webrtcvad.Vad(args.vad_level)
     is_speech = lambda f: vad.is_speech(f, SAMPLE_RATE)
+    # Textual replaces sys.stderr with an object whose fileno() is -1. Loading Whisper makes
+    # tqdm start this tracker, which passes that fd to its child and fails with "bad value(s)
+    # in fds_to_keep". Starting it here, while stderr is real, avoids that.
+    resource_tracker.ensure_running()
     VoiceApp(
         HermesClient(api_key),
         datetime.now().strftime("voice-%Y%m%d-%H%M%S"),
