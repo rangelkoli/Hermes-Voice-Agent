@@ -23,6 +23,12 @@ def test_speech_without_wake_phrase_is_ignored():
 def test_wake_phrase_alone_is_ignored():
     assert apply_wake("Hey Hermes.", "hermes") is None
 
+def test_hey_with_punctuation_is_a_wake_phrase():
+    assert apply_wake("hey, hermes open the logs", "hermes") == "open the logs"
+
+def test_prompt_word_alone_is_noise():
+    assert is_noise("Hermes.")
+
 def test_join_skips_likely_non_speech_segments():
     segs = [NS(text=" open logs", no_speech_prob=0.1), NS(text=" Thank you", no_speech_prob=0.9)]
     assert join_segments(segs) == "open logs"

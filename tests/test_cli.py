@@ -130,7 +130,7 @@ def test_default_flags_reach_constructors(monkeypatch, tmp_path):
     assert re.fullmatch(r"voice-\d{8}-\d{6}", app.session_id)
     assert seen["call"][0] == "http://127.0.0.1:8642/health"
     assert seen["call"][1] == 3
-    assert seen["call"][2] == {}
+    assert seen["call"][2] == {"trust_env": False}
     assert app.client._client.headers["Authorization"] == "Bearer test-key"
     assert str(app.client._client.base_url).rstrip("/") == "http://127.0.0.1:8642"
     assert app.segmenter._is_speech(b"\x00" * FRAME_BYTES) in (True, False)
@@ -167,3 +167,25 @@ def test_explicit_flags_reach_constructors(monkeypatch, tmp_path):
     assert app.wake == "hermes"
     app.segmenter._is_speech(b"\x00" * FRAME_BYTES)
     assert rates == [SAMPLE_RATE]
+
+
+def test_health_check_ignores_http_proxy(monkeypatch, tmp_path):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    seen = _ready(monkeypatch, tmp_path)
+    found, _modes, _rates = _capture_app(monkeypatch)
+
+    main([])
+
+    assert seen["call"][2]["trust_env"] is False
+    assert found["app"].client._client.trust_env is False
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_end_silence_must_be_positive(monkeypatch, tmp_path, value):
+    _ready(monkeypatch, tmp_path)
+    _capture_app(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--end-silence-ms", value])
+
+    assert exc.value.code == 2

@@ -272,7 +272,9 @@ class VoiceApp(App[None]):
         if self._muted or self._stop_audio.is_set():
             return
         if self._retry_mic:
-            self._mic_lost = True
+            with self._audio_lock:
+                if not self._muted and not self._stop_audio.is_set():
+                    self._mic_lost = True
             self._on_ui(self._sync_status)
             if not self._wait_to_retry():
                 return
@@ -293,7 +295,9 @@ class VoiceApp(App[None]):
             if self._stop_audio.is_set() or self._muted:
                 return False
             if self.mic.alive:
-                self._mic_lost = False
+                with self._audio_lock:
+                    if not self._muted:
+                        self._mic_lost = False
                 self._on_ui(self._sync_status)
                 return False
             self._stop_audio.wait(_AUDIO_WAIT)
@@ -414,8 +418,10 @@ class VoiceApp(App[None]):
                 return
 
     def on_transcript(self, text: str) -> None:
+        if self._stop_sending:
+            return
         spoken = apply_wake(text, self.wake)
-        if spoken is None:
+        if spoken is None or is_noise(spoken):
             return
         self.log_line(f"You  {spoken}")
         self._pending.append(spoken)
@@ -451,11 +457,6 @@ class VoiceApp(App[None]):
                 except HermesUnavailable:
                     self._offline = True
                     self._sync_status()
-                    self.set_timer(self._retry_seconds, self._ensure_send)
-                    return
-                except HermesAuthError:
-                    self._stop_sending = True
-                    self.log_line("Hermes rejected the API key. Check API_SERVER_KEY.")
                     return
                 self._offline = False
                 del self._pending[: len(batch)]
@@ -473,10 +474,19 @@ class VoiceApp(App[None]):
                     self._sync_status()
         except asyncio.CancelledError:
             raise
+        except HermesAuthError:
+            self._stop_sending = True
+            self._offline = True
+            self._sync_status()
+            self.log_line(
+                "Speech is not being sent until the API key is fixed and the app is restarted."
+            )
         except Exception as exc:
             self.log_line(f"Send failed: {exc}")
         finally:
             self._busy = False
+            if self._pending and not self._stop_sending and not self._quit:
+                self.set_timer(self._retry_seconds, self._ensure_send)
 
     def _on_event(self, event: RunEvent) -> None:
         name = event.name
@@ -498,6 +508,8 @@ class VoiceApp(App[None]):
             self.log_line(str(data.get("error", "The run failed.")))
             self._clear_reply()
         elif name in ("run.cancelled", "run.interrupted"):
+            if self._reply:
+                self.log_line(self._reply)
             self.log_line("The run ended early.")
             self._clear_reply()
 
@@ -532,6 +544,7 @@ class VoiceApp(App[None]):
             self._muted = not self._muted
             if self._muted:
                 self._mute_gen += 1
+                self._mic_lost = False
                 self.mic.stop()
                 if self.segmenter is not None:
                     self.segmenter.reset()
@@ -594,6 +607,12 @@ class VoiceApp(App[None]):
         if self.mic is not None:
             self.mic.stop()
         await self._join_audio()
+        run_id = self._run_id
+        if run_id is not None:
+            try:
+                await self.client.stop(run_id)
+            except Exception:
+                pass
         try:
             await self.client.aclose()
         except Exception as exc:

@@ -62,6 +62,7 @@ class HermesClient:
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=httpx.Timeout(10, read=None),
             transport=transport,
+            trust_env=False,
         )
 
     async def start_run(self, text: str, session_id: str) -> str:
@@ -74,17 +75,32 @@ class HermesClient:
         # ponytail: each data line is one JSON object. Multi-line SSE data fields are not joined.
         finished = False
         try:
-            async with self._client.stream("GET", f"/v1/runs/{run_id}/events") as response:
-                _raise_for_status(response)
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    payload = json.loads(line.removeprefix("data: "))
-                    event = RunEvent(payload["event"], payload)
-                    yield event
-                    if event.name in TERMINAL:
-                        finished = True
-                        break
+            async with self._client.stream(
+                "GET",
+                f"/v1/runs/{run_id}/events",
+                timeout=httpx.Timeout(10, read=None),
+            ) as response:
+                if response.status_code in (401, 403):
+                    raise HermesAuthError(
+                        f"Hermes rejected the API key ({response.status_code})"
+                    )
+                if response.status_code not in (404, 500):
+                    _raise_for_status(response)
+                if response.is_success:
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        try:
+                            payload = json.loads(line.removeprefix("data: "))
+                        except json.JSONDecodeError:
+                            break
+                        event = RunEvent(payload["event"], payload)
+                        yield event
+                        if event.name in TERMINAL:
+                            finished = True
+                            break
+        except HermesAuthError:
+            raise
         except httpx.TransportError:
             # Dropped connection. An unfinished stream becomes run.interrupted below.
             pass
@@ -105,7 +121,7 @@ class HermesClient:
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         try:
-            response = await self._client.request(method, path, **kwargs)
+            response = await self._client.request(method, path, timeout=30, **kwargs)
         except httpx.TransportError as exc:
             raise HermesUnavailable(str(exc)) from exc
         _raise_for_status(response)

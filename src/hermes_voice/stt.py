@@ -9,6 +9,7 @@ _NOISE = frozenset({
     "thank you",
     "thanks for watching",
     "you",
+    "hermes",
 })
 
 _PUNCTUATION = str.maketrans("", "", string.punctuation)
@@ -29,7 +30,7 @@ def apply_wake(text: str, wake: str | None) -> str | None:
     if wake is None:
         return text
     match = re.match(
-        rf"^\W*(hey\s+)?{re.escape(wake)}\b\W*",
+        rf"^\W*(?:hey\W+)?{re.escape(wake)}\b\W*",
         text,
         re.IGNORECASE,
     )

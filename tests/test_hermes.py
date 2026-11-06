@@ -68,3 +68,50 @@ def test_hermes_home_is_respected(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("API_SERVER_KEY=fromhome\n")
     assert load_api_key() == "fromhome"
+
+def test_client_ignores_http_proxy(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+    assert client(lambda r: httpx.Response(200))._client.trust_env is False
+
+@pytest.mark.parametrize("call", ["start_run", "stop", "approve"])
+def test_read_timeout_on_calls_is_unavailable(call):
+    seen = {}
+
+    def h(req):
+        seen["read"] = req.extensions["timeout"]["read"]
+        raise httpx.ReadTimeout("hung", request=req)
+
+    c = client(h)
+    action = {
+        "start_run": lambda: c.start_run("hi", "s"),
+        "stop": lambda: c.stop("run_1"),
+        "approve": lambda: c.approve("run_1", "deny"),
+    }[call]
+    with pytest.raises(HermesUnavailable):
+        asyncio.run(action())
+    assert seen["read"] == 30
+
+def test_event_stream_read_stays_open():
+    seen = {}
+
+    def h(req):
+        seen["read"] = req.extensions["timeout"]["read"]
+        return httpx.Response(200, content=sse({"event": "run.completed", "output": "ok"}))
+
+    asyncio.run(collect(client(h)))
+    assert seen["read"] is None
+
+@pytest.mark.parametrize("status", [404, 500])
+def test_events_error_status_yields_interrupted(status):
+    got = asyncio.run(collect(client(lambda r: httpx.Response(status))))
+    assert [e.name for e in got] == ["run.interrupted"]
+
+def test_events_non_json_yields_interrupted():
+    got = asyncio.run(collect(client(lambda r: httpx.Response(200, content=b"data: not-json\n\n"))))
+    assert [e.name for e in got] == ["run.interrupted"]
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_events_auth_error_still_raises(status):
+    with pytest.raises(HermesAuthError):
+        asyncio.run(collect(client(lambda r: httpx.Response(status))))

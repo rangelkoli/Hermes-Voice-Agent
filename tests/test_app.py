@@ -4,11 +4,12 @@ import threading
 import time
 
 import httpx
+import pytest
 from textual.widgets import RichLog, Sparkline
 
 from hermes_voice.app import VoiceApp
 from hermes_voice.audio import FRAME_BYTES, MIC_SILENT_HINT, MicError, Segmenter
-from hermes_voice.hermes import HermesUnavailable, RunEvent
+from hermes_voice.hermes import HermesAuthError, HermesUnavailable, RunEvent
 from hermes_voice.stt import is_noise
 
 
@@ -176,6 +177,19 @@ def test_wake_mode_ignores_speech_without_the_phrase():
             app.on_transcript("what's for dinner")
             app.on_transcript("hermes open the logs"); await pilot.pause()
             assert c.started == ["open the logs"]
+    run(go)
+
+
+def test_wake_phrase_noise_does_not_start_a_run():
+    async def go():
+        c = FakeClient()
+        app = VoiceApp(c, "voice-test", wake="hermes")
+        async with app.run_test() as pilot:
+            app.on_transcript("Hermes, thank you.")
+            await pilot.pause()
+            assert c.started == []
+            assert "thank you" not in _log_text(app)
+            assert app._pending == []
     run(go)
 
 
@@ -629,6 +643,106 @@ def test_model_load_error_stays_loading_and_retries():
             app._stop_audio.set()
             await asyncio.to_thread(app._stt_thread.join, 1.0)
             assert not app._stt_thread.is_alive()
+    run(go)
+
+
+def test_pending_speech_is_retried_when_send_exits():
+    class DieInEvents(FakeClient):
+        async def events(self, run_id: str):
+            del run_id
+            await asyncio.sleep(0.2)
+            if self.started:
+                raise RuntimeError("stream died")
+            yield RunEvent("run.interrupted", {})
+
+    async def go():
+        c = DieInEvents()
+        app = VoiceApp(c, "voice-test", retry_seconds=0.01)
+        async with app.run_test() as pilot:
+            app.on_transcript("first")
+            await until(lambda: c.started == ["first"])
+            app.on_transcript("second")
+            await until(lambda: c.started == ["first", "second"])
+            assert app._pending == []
+    run(go)
+
+
+@pytest.mark.parametrize("name", ["run.cancelled", "run.interrupted"])
+def test_partial_reply_is_logged_when_the_run_ends_early(name):
+    async def go():
+        c = FakeClient(script=[
+            RunEvent("message.delta", {"delta": "partial answer"}),
+            RunEvent(name, {}),
+        ])
+        app = VoiceApp(c, "voice-test")
+        async with app.run_test() as pilot:
+            app.on_transcript("hi")
+            await pilot.pause()
+            assert "partial answer" in _log_text(app)
+    run(go)
+
+
+def test_bad_key_stays_offline_and_drops_later_speech():
+    class RejectKey(FakeClient):
+        async def start_run(self, text: str, session_id: str) -> str:
+            del session_id
+            self.started.append(text)
+            raise HermesAuthError("bad key")
+
+    async def go():
+        c = RejectKey()
+        app = VoiceApp(c, "voice-test", retry_seconds=0.01)
+        async with app.run_test() as pilot:
+            app.on_transcript("hello")
+            await pilot.pause()
+            app.on_transcript("again")
+            await asyncio.sleep(0.05)
+            await pilot.pause()
+            assert c.started == ["hello"]
+            assert app.status == "offline"
+            assert app._pending == ["hello"]
+            assert "You  again" not in _log_text(app)
+            assert _log_text(app).count("not being sent") == 1
+    run(go)
+
+
+def test_quit_stops_the_active_run():
+    class StopFails(FakeClient):
+        async def stop(self, run_id: str) -> None:
+            self.stops.append(run_id)
+            raise RuntimeError("nope")
+
+    async def go():
+        c = StopFails(hold=True)
+        app = VoiceApp(c, "voice-test")
+        async with app.run_test() as pilot:
+            app.on_transcript("long job")
+            await pilot.pause()
+            await pilot.press("q")
+        assert c.stops == ["run_1"]
+        assert c._closed
+    run(go)
+
+
+def test_mute_during_mic_lost_shows_muted():
+    async def go():
+        mic = FakeMic()
+        app = VoiceApp(
+            FakeClient(),
+            "voice-test",
+            mic=mic,
+            transcriber=FakeTranscriber([]),
+            segmenter=_segmenter(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await until(lambda: mic.reads >= 1 and mic.starts >= 1 and app.status == "listening")
+            mic.alive = False
+            await until(lambda: app.status == "mic lost")
+            await pilot.press("m")
+            await pilot.pause()
+            await asyncio.sleep(0.2)
+            assert app.status == "muted"
     run(go)
 
 

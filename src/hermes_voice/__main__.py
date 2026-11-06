@@ -23,6 +23,13 @@ def _device(value: str) -> int | str:
         return value
 
 
+def _end_silence_ms(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("--end-silence-ms must be greater than 0")
+    return number
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="hermes-voice")
     parser.add_argument("--wake")
@@ -30,7 +37,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--stt-model", default="small.en")
     parser.add_argument("--vad-level", type=int, choices=(0, 1, 2, 3), default=2)
-    parser.add_argument("--end-silence-ms", type=int, default=1000)
+    parser.add_argument("--end-silence-ms", type=_end_silence_ms, default=1000)
     args = parser.parse_args(argv)
 
     if args.list_devices:
@@ -54,7 +61,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(1) from None
 
     try:
-        httpx.get(_HEALTH_URL, timeout=3).raise_for_status()
+        httpx.get(_HEALTH_URL, timeout=3, trust_env=False).raise_for_status()
     except httpx.HTTPError:
         print(_GATEWAY, file=sys.stderr)
         raise SystemExit(1) from None
