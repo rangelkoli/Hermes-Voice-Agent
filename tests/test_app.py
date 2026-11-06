@@ -171,30 +171,16 @@ def test_escape_stops_the_active_run():
             assert c.stops == ["run_1"]
     run(go)
 
-class _Spotter:
-    def __init__(self, hit=False):
-        self.hit = hit
-        self.fed: list[bytes] = []
-        self.resets = 0
-
-    def feed(self, frame: bytes) -> bool:
-        self.fed.append(frame)
-        return self.hit
-
-    def reset(self) -> None:
-        self.resets += 1
-
-
 def test_wake_mode_ignores_speech_without_the_phrase():
     async def go():
         c = FakeClient()
-        spotter = _Spotter()
-        gate = WakeGate(spotter)
+        gate = WakeGate()
         app = VoiceApp(c, "voice-test", wake="hey hermes", gate=gate)
         async with app.run_test() as pilot:
             app.on_transcript("what's for dinner")
-            spotter.hit = True
-            gate.feed(b"now")
+            await pilot.pause()
+            assert c.started == []
+            gate.wake()
             app.on_transcript("hey hermes open the logs")
             await pilot.pause()
             assert c.started == ["open the logs"]
@@ -204,8 +190,8 @@ def test_wake_mode_ignores_speech_without_the_phrase():
 def test_wake_phrase_noise_does_not_start_a_run():
     async def go():
         c = FakeClient()
-        gate = WakeGate(_Spotter(hit=True))
-        gate.feed(b"now")
+        gate = WakeGate()
+        gate.wake()
         app = VoiceApp(c, "voice-test", wake="hermes", gate=gate)
         async with app.run_test() as pilot:
             app.on_transcript("Hermes, thank you.")
@@ -347,6 +333,7 @@ class FakeTranscriber:
         self._texts = list(texts)
         self.hold = hold
         self.calls = 0
+        self.heard: list[bytes] = []
         self.entered = threading.Event()
         self.release = threading.Event()
 
@@ -354,7 +341,7 @@ class FakeTranscriber:
         return None
 
     def transcribe(self, pcm: bytes) -> str:
-        del pcm
+        self.heard.append(pcm)
         self.calls += 1
         self.entered.set()
         if self.hold:
@@ -1311,20 +1298,6 @@ class _FrameMic(FakeMic):
             return None
 
 
-class _HitOn:
-    def __init__(self, which: int):
-        self.which = which
-        self.n = 0
-
-    def feed(self, frame: bytes) -> bool:
-        del frame
-        self.n += 1
-        return self.n == self.which
-
-    def reset(self) -> None:
-        return None
-
-
 class _Clock:
     def __init__(self):
         self.now = 0.0
@@ -1335,7 +1308,7 @@ class _Clock:
 
 def test_status_is_waiting_while_asleep():
     async def go():
-        gate = WakeGate(_Spotter())
+        gate = WakeGate()
         app = VoiceApp(FakeClient(), "voice-test", wake="hey hermes", gate=gate)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -1345,63 +1318,11 @@ def test_status_is_waiting_while_asleep():
     run(go)
 
 
-def test_frames_never_reach_the_segmenter_while_asleep():
-    async def go():
-        segmenter = _IdleSegmenter()
-        mic = FakeMic([_SPEECH] * 30)
-        c = FakeClient()
-        app = VoiceApp(
-            c,
-            "voice-test",
-            wake="hey hermes",
-            gate=WakeGate(_Spotter()),
-            mic=mic,
-            transcriber=FakeTranscriber([]),
-            segmenter=segmenter,
-        )
-        async with app.run_test() as pilot:
-            del pilot
-            await until(lambda: not mic.frames and len(app._levels) > 0 and app.status == "waiting")
-            assert segmenter.frames == []
-            assert c.started == []
-            assert app.status == "waiting"
-    run(go)
-
-
-def test_wake_hit_rings_the_bell_and_status_is_listening(monkeypatch):
-    rang = []
-    monkeypatch.setattr(VoiceApp, "bell", lambda self: rang.append(self))
-
-    async def go():
-        segmenter = _IdleSegmenter()
-        spotter = _HitOn(2)
-        gate = WakeGate(spotter)
-        mic = _FrameMic()
-        mic.box.put(_QUIET)
-        app = VoiceApp(
-            FakeClient(),
-            "voice-test",
-            wake="hey hermes",
-            gate=gate,
-            mic=mic,
-            transcriber=FakeTranscriber([]),
-            segmenter=segmenter,
-        )
-        async with app.run_test() as pilot:
-            del pilot
-            await until(lambda: spotter.n >= 1 and segmenter.frames == [] and app.status == "waiting")
-            mic.box.put(_SPEECH)
-            await until(lambda: app.status == "listening" and len(rang) == 1)
-            assert gate.awake is True
-            assert segmenter.frames == [_QUIET, _SPEECH]
-    run(go)
-
-
 def test_one_breath_command_is_sent_without_the_phrase():
     async def go():
         c = FakeClient()
-        gate = WakeGate(_Spotter(hit=True))
-        gate.feed(b"wake")
+        gate = WakeGate()
+        gate.wake()
         app = VoiceApp(c, "voice-test", wake="hey hermes", gate=gate)
         async with app.run_test() as pilot:
             app.on_transcript("Hey Hermes, open the logs")
@@ -1413,8 +1334,8 @@ def test_one_breath_command_is_sent_without_the_phrase():
 def test_phrase_only_transcript_keeps_the_gate_open():
     async def go():
         c = FakeClient()
-        gate = WakeGate(_Spotter(hit=True))
-        gate.feed(b"wake")
+        gate = WakeGate()
+        gate.wake()
         app = VoiceApp(c, "voice-test", wake="hey hermes", gate=gate)
         async with app.run_test() as pilot:
             app.on_transcript("Hey Hermes.")
@@ -1427,25 +1348,11 @@ def test_phrase_only_transcript_keeps_the_gate_open():
     run(go)
 
 
-def test_gate_closes_after_a_command():
-    async def go():
-        c = FakeClient()
-        gate = WakeGate(_Spotter(hit=True))
-        gate.feed(b"wake")
-        app = VoiceApp(c, "voice-test", wake="hey hermes", gate=gate)
-        async with app.run_test() as pilot:
-            app.on_transcript("Hey Hermes, open the logs")
-            await pilot.pause()
-            assert c.started == ["open the logs"]
-            assert gate.awake is False
-    run(go)
-
-
 def test_transcript_arriving_after_the_gate_closed_is_dropped():
     async def go():
         c = FakeClient()
-        gate = WakeGate(_Spotter(hit=True))
-        gate.feed(b"wake")
+        gate = WakeGate()
+        gate.wake()
         app = VoiceApp(c, "voice-test", wake="hey hermes", gate=gate)
         async with app.run_test() as pilot:
             app.on_transcript("Hey Hermes, open the logs")
@@ -1456,12 +1363,30 @@ def test_transcript_arriving_after_the_gate_closed_is_dropped():
     run(go)
 
 
+class _EmitCount:
+    """Returns one utterance per push, for the first `count` frames."""
+
+    def __init__(self, count):
+        self.in_speech = False
+        self.count = count
+        self.n = 0
+
+    def push(self, frame):
+        del frame
+        self.n += 1
+        if self.n <= self.count:
+            return f"utt-{self.n}".encode()
+        return None
+
+    def reset(self):
+        self.in_speech = False
+
+
 def test_window_expiry_returns_to_waiting():
     async def go():
         clock = _Clock()
-        gate = WakeGate(_HitOn(1), window_s=8, clock=clock)
+        gate = WakeGate(window_s=8, clock=clock)
         mic = _FrameMic()
-        segmenter = _IdleSegmenter()
         app = VoiceApp(
             FakeClient(),
             "voice-test",
@@ -1469,7 +1394,8 @@ def test_window_expiry_returns_to_waiting():
             gate=gate,
             mic=mic,
             transcriber=FakeTranscriber([]),
-            segmenter=segmenter,
+            wake_transcriber=FakeTranscriber(["Hey Hermes"]),
+            segmenter=_EmitCount(1),
         )
         async with app.run_test() as pilot:
             del pilot
@@ -1482,35 +1408,10 @@ def test_window_expiry_returns_to_waiting():
     run(go)
 
 
-def test_mute_closes_the_gate():
-    async def go():
-        spotter = _Spotter(hit=True)
-        gate = WakeGate(spotter)
-        gate.feed(b"wake")
-        app = VoiceApp(
-            FakeClient(),
-            "voice-test",
-            wake="hey hermes",
-            gate=gate,
-            mic=FakeMic(),
-            transcriber=FakeTranscriber([]),
-            segmenter=_segmenter(),
-        )
-        async with app.run_test() as pilot:
-            await until(lambda: app.status == "listening")
-            await pilot.press("m")
-            await pilot.pause()
-            assert app.status == "muted"
-            assert gate.awake is False
-            assert spotter.resets >= 1
-    run(go)
-
-
 def test_speech_playback_closes_the_gate():
     async def go():
-        spotter = _Spotter(hit=True)
-        gate = WakeGate(spotter)
-        gate.feed(b"wake")
+        gate = WakeGate()
+        gate.wake()
         speaker = FakeSpeaker(hold=True)
         c = FakeClient(script=[RunEvent("run.completed", {"output": "Hello."})])
         app = VoiceApp(c, "voice-test", wake="hey hermes", gate=gate, speaker=speaker)
@@ -1520,16 +1421,15 @@ def test_speech_playback_closes_the_gate():
             app._ensure_send()
             await until(lambda: app.status == "speaking")
             assert gate.awake is False
-            assert spotter.resets >= 1
+            assert app._utterances.empty()
             speaker.release.set()
     run(go)
 
 
 def test_mic_loss_closes_the_gate():
     async def go():
-        spotter = _Spotter(hit=True)
-        gate = WakeGate(spotter)
-        gate.feed(b"wake")
+        gate = WakeGate()
+        gate.wake()
         mic = FakeMic()
         app = VoiceApp(
             FakeClient(),
@@ -1543,9 +1443,10 @@ def test_mic_loss_closes_the_gate():
         async with app.run_test() as pilot:
             del pilot
             await until(lambda: mic.starts >= 1 and app.status == "listening")
+            app._utterances.put((b"queued", 0))
             mic.alive = False
             await until(lambda: app.status == "mic lost" and gate.awake is False)
-            assert spotter.resets >= 1
+            assert app._utterances.empty()
             mic.alive = True
             await until(lambda: app.status == "waiting", timeout=3.5)
     run(go)
@@ -1608,11 +1509,17 @@ class _RecordingTranscriber:
         return self._texts.pop(0)
 
 
-def test_utterance_queued_behind_an_accepted_command_is_not_transcribed():
+def test_next_wake_during_cloud_transcription_is_not_lost():
     async def go():
-        heard = _RecordingTranscriber(["Hey Hermes, open the logs", "what is the weather"])
-        gate = WakeGate(_Spotter(hit=True))
-        gate.feed(b"wake")
+        cloud = _RecordingTranscriber([
+            "Hey Hermes, open the logs",
+            "Hey Hermes, what time is it",
+        ])
+        wake = FakeTranscriber([
+            "Hey Hermes, open the logs",
+            "Hey Hermes, what time is it",
+        ])
+        gate = WakeGate()
         mic = FakeMic()
         c = FakeClient()
         app = VoiceApp(
@@ -1621,30 +1528,29 @@ def test_utterance_queued_behind_an_accepted_command_is_not_transcribed():
             wake="hey hermes",
             gate=gate,
             mic=mic,
-            transcriber=heard,
+            transcriber=cloud,
+            wake_transcriber=wake,
             segmenter=_IdleSegmenter(),
         )
         async with app.run_test() as pilot:
             del pilot
             await until(lambda: mic.starts >= 1)
             app._utterances.put((b"first", 0))
-            app._utterances.put((b"second", 0))
             try:
-                await until(lambda: heard.heard == [b"first"] and app._utterances.qsize() == 1)
-                heard.release.set()
-                await until(lambda: c.started == ["open the logs"])
-                await asyncio.sleep(0.35)
-                assert heard.heard == [b"first"]
+                await until(lambda: cloud.entered.is_set() and app._utterances.qsize() == 0)
+                app._utterances.put((b"second", 0))
+                cloud.release.set()
+                await until(lambda: c.started == ["open the logs", "what time is it"])
             finally:
-                heard.release.set()
+                cloud.release.set()
     run(go)
 
 
 def test_reply_during_wake_transcription_plays_after_the_command_is_sent():
     async def go():
         heard = _RecordingTranscriber(["Hey Hermes, open the logs"])
-        gate = WakeGate(_Spotter(hit=True))
-        gate.feed(b"wake")
+        gate = WakeGate()
+        gate.wake()
         speaker = FakeSpeaker()
         mic = FakeMic()
         c = FakeClient()
@@ -1692,8 +1598,8 @@ def test_accepted_command_returns_to_waiting_and_the_reply_plays_promptly():
         segmenter = Stuck()
         speaker = FakeSpeaker()
         c = FakeClient(script=[RunEvent("run.completed", {"output": "Ready."})])
-        gate = WakeGate(_Spotter(hit=True))
-        gate.feed(b"wake")
+        gate = WakeGate()
+        gate.wake()
         app = VoiceApp(
             c,
             "voice-test",
@@ -1712,4 +1618,244 @@ def test_accepted_command_returns_to_waiting_and_the_reply_plays_promptly():
             assert segmenter.in_speech is False
             await until(lambda: speaker.spoke == ["Ready."], timeout=2)
             assert c.started == ["open the logs"]
+    run(go)
+
+
+def test_talk_while_asleep_never_reaches_the_cloud():
+    # The wake model hears the room. The cloud model and Hermes do not.
+    async def go():
+        frames = [_SPEECH] * 20 + [_QUIET] * 34
+        mic = FakeMic(frames)
+        wake = FakeTranscriber(["what's for dinner"])
+        cloud = FakeTranscriber(["what's for dinner"])
+        c = FakeClient()
+        app = VoiceApp(
+            c,
+            "voice-test",
+            wake="hey hermes",
+            gate=WakeGate(),
+            mic=mic,
+            transcriber=cloud,
+            wake_transcriber=wake,
+            segmenter=_segmenter(),
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            await until(lambda: wake.calls >= 1)
+            await asyncio.sleep(0.2)
+            assert wake.heard
+            assert cloud.calls == 0
+            assert c.started == []
+            assert app.status == "waiting"
+            assert app._hearing is False
+    run(go)
+
+
+def test_wake_utterance_goes_to_the_cloud_and_strips_the_phrase():
+    async def go():
+        frames = [_SPEECH] * 20 + [_QUIET] * 34
+        mic = FakeMic(frames)
+        wake = FakeTranscriber(["Hey Hermes, open the logs"])
+        cloud = FakeTranscriber(["Hey Hermes, open the logs"])
+        c = FakeClient()
+        app = VoiceApp(
+            c,
+            "voice-test",
+            wake="hey hermes",
+            gate=WakeGate(),
+            mic=mic,
+            transcriber=cloud,
+            wake_transcriber=wake,
+            segmenter=_segmenter(),
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            await until(lambda: c.started == ["open the logs"])
+            assert cloud.calls == 1
+            assert wake.calls == 1
+    run(go)
+
+
+def test_wake_rings_the_bell(monkeypatch):
+    rang = []
+    monkeypatch.setattr(VoiceApp, "bell", lambda self: rang.append(self))
+
+    async def go():
+        wake = FakeTranscriber(["Hey Hermes"])
+        cloud = FakeTranscriber(["should not run"])
+        gate = WakeGate()
+        app = VoiceApp(
+            FakeClient(),
+            "voice-test",
+            wake="hey hermes",
+            gate=gate,
+            mic=FakeMic([_SPEECH]),
+            transcriber=cloud,
+            wake_transcriber=wake,
+            segmenter=_EmitCount(1),
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            await until(lambda: len(rang) == 1 and app.status == "listening")
+            await asyncio.sleep(0.2)
+            assert cloud.calls == 0
+            assert gate.awake is True
+    run(go)
+
+
+def test_phrase_only_opens_the_window_for_the_next_utterance():
+    # The phrase-only utterance is not sent. The next one is.
+    async def go():
+        wake = FakeTranscriber(["Hey Hermes.", "open the logs"])
+        cloud = FakeTranscriber(["open the logs"])
+        c = FakeClient()
+        app = VoiceApp(
+            c,
+            "voice-test",
+            wake="hey hermes",
+            gate=WakeGate(),
+            mic=FakeMic([_SPEECH, _SPEECH]),
+            transcriber=cloud,
+            wake_transcriber=wake,
+            segmenter=_EmitCount(2),
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            await until(lambda: c.started == ["open the logs"])
+            await asyncio.sleep(0.2)
+            assert cloud.calls == 1
+            assert wake.calls == 1
+    run(go)
+
+
+def test_gate_closes_after_a_command():
+    async def go():
+        frames = [_SPEECH] * 20 + [_QUIET] * 34
+        gate = WakeGate()
+        c = FakeClient()
+        app = VoiceApp(
+            c,
+            "voice-test",
+            wake="hey hermes",
+            gate=gate,
+            mic=FakeMic(frames),
+            transcriber=FakeTranscriber(["Hey Hermes, open the logs"]),
+            wake_transcriber=FakeTranscriber(["Hey Hermes, open the logs"]),
+            segmenter=_segmenter(),
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            await until(lambda: c.started == ["open the logs"])
+            assert gate.awake is False
+            await until(lambda: app.status == "waiting")
+    run(go)
+
+
+def test_mute_closes_the_gate_and_drops_queued_audio():
+    async def go():
+        gate = WakeGate()
+        gate.wake()
+        cloud = FakeTranscriber(["Hey Hermes, open the logs", "and the metrics"], hold=True)
+        c = FakeClient()
+        app = VoiceApp(
+            c,
+            "voice-test",
+            wake="hey hermes",
+            gate=gate,
+            mic=FakeMic([_SPEECH, _SPEECH]),
+            transcriber=cloud,
+            segmenter=_EmitCount(2),
+        )
+        async with app.run_test() as pilot:
+            try:
+                await until(lambda: cloud.calls == 1 and app._utterances.qsize() >= 1)
+                await pilot.press("m")
+                await pilot.pause()
+                assert app.status == "muted"
+                assert gate.awake is False
+                assert app._utterances.empty()
+                cloud.release.set()
+                await asyncio.sleep(0.2)
+                assert c.started == []
+            finally:
+                cloud.release.set()
+    run(go)
+
+
+def test_talk_while_asleep_does_not_delay_a_spoken_reply():
+    class Talking:
+        def __init__(self):
+            self.in_speech = True
+
+        def push(self, frame):
+            del frame
+            return None
+
+        def reset(self):
+            return None
+
+    async def go():
+        speaker = FakeSpeaker()
+        gate = WakeGate()
+        app = VoiceApp(
+            FakeClient(),
+            "voice-test",
+            wake="hey hermes",
+            gate=gate,
+            speaker=speaker,
+            segmenter=Talking(),
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            app._utterances.put((b"room-talk", 0))
+            app._speech.put("Ready.")
+            await until(lambda: speaker.spoke == ["Ready."], timeout=1)
+            assert app._utterances.empty()
+            assert gate.awake is False
+    run(go)
+
+
+def test_wake_model_failure_logs_and_sends_nothing():
+    class NeverWakes(FakeTranscriber):
+        def __init__(self):
+            super().__init__([])
+            self.loads = 0
+            self.times: list[float] = []
+
+        def load(self) -> None:
+            self.loads += 1
+            self.times.append(time.monotonic())
+            raise RuntimeError("wake model missing")
+
+    async def go():
+        wake = NeverWakes()
+        cloud = FakeTranscriber(["open the logs"])
+        c = FakeClient()
+        frames = [_SPEECH] * 20 + [_QUIET] * 34
+        app = VoiceApp(
+            c,
+            "voice-test",
+            wake="hey hermes",
+            gate=WakeGate(),
+            mic=FakeMic(frames),
+            transcriber=cloud,
+            wake_transcriber=wake,
+            segmenter=_segmenter(),
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            await until(
+                lambda: wake.loads >= 2 or not app._stt_thread.is_alive(),
+                timeout=8,
+            )
+            assert wake.loads >= 2
+            assert app._stt_thread.is_alive()
+            assert app.status == "loading"
+            assert cloud.calls == 0
+            assert c.started == []
+            assert _log_text(app).count("wake model missing") == 1
+            assert wake.times[1] - wake.times[0] >= 5
+            app._stop_audio.set()
+            await asyncio.to_thread(app._stt_thread.join, 1.0)
+            assert not app._stt_thread.is_alive()
     run(go)

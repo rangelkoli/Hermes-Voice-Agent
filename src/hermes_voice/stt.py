@@ -2,6 +2,7 @@
 
 import re
 import string
+import unicodedata
 from collections.abc import Iterable
 
 # ponytail: known phrases only.
@@ -26,26 +27,30 @@ def is_noise(text: str) -> bool:
     return normalized in _NOISE
 
 
-def strip_wake(text: str, phrase: str) -> str:
-    """Return the words after the last time the phrase appears.
+def _fold(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in normalized if not unicodedata.combining(char))
 
-    A phrase that starts with "hey" still matches when that word was dropped.
-    No match leaves the text as it is: the detector already heard the phrase.
+
+def wake_match(text: str, phrase: str) -> str | None:
+    """Return the text after the wake word, or None when it was not said.
+
+    The key word is the phrase's last word. An empty string means the phrase
+    was the whole utterance.
     """
-    words = [re.escape(word) for word in phrase.split()]
+    words = _fold(phrase).split()
     if not words:
-        return text
-    if phrase.lower().startswith("hey ") and len(words) > 1:
-        body = r"\W+".join(words[1:])
-        pattern = rf"(?:{words[0]}\W+)?{body}"
-    else:
-        pattern = r"\W+".join(words)
-    pattern = rf"\b(?:{pattern})\b"
-    matches = list(re.finditer(pattern, text, flags=re.IGNORECASE))
+        return None
+    folded = _fold(text)
+    word = re.escape(words[-1])
+    # ponytail: the key word has to be one of the first three words, and a
+    # sentence break is only . ! or ?. A Hermes later in the sentence is ignored.
+    pattern = rf"(?:^|[.!?]\s+)(?:[\w'’]+[\s,]+){{0,2}}?{word}\b\W*"
+    matches = list(re.finditer(pattern, folded, flags=re.IGNORECASE))
     if not matches:
-        return text
-    remainder = text[matches[-1].end() :]
-    return remainder.strip(string.punctuation + string.whitespace)
+        return None
+    remainder = folded[matches[-1].end() :]
+    return remainder.lstrip(string.punctuation + string.whitespace)
 
 
 def join_segments(segments: Iterable) -> str:
@@ -58,8 +63,9 @@ def join_segments(segments: Iterable) -> str:
 
 
 class Transcriber:
-    def __init__(self, model: str = "small.en"):
+    def __init__(self, model: str = "small.en", hotword: str | None = None) -> None:
         self.model = model
+        self.hotword = hotword
         self._model = None
 
     def load(self) -> None:
@@ -71,10 +77,14 @@ class Transcriber:
         import numpy as np
 
         audio = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
-        segments, _info = self._model.transcribe(
-            audio,
-            beam_size=1,
-            condition_on_previous_text=False,
-            initial_prompt="Hermes",
-        )
+        kwargs = {
+            "beam_size": 1,
+            "condition_on_previous_text": False,
+        }
+        if self.hotword:
+            kwargs["hotwords"] = self.hotword
+            kwargs["vad_filter"] = False
+        else:
+            kwargs["initial_prompt"] = "Hermes"
+        segments, _info = self._model.transcribe(audio, **kwargs)
         return join_segments(segments)

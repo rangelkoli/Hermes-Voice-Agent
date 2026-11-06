@@ -19,7 +19,7 @@ from textual.widgets import Footer, RichLog, Sparkline, Static
 from hermes_voice.audio import MIC_SILENT_HINT, MicError, level
 from hermes_voice.gemini import speakable
 from hermes_voice.hermes import TERMINAL, HermesAuthError, HermesUnavailable, RunEvent
-from hermes_voice.stt import is_noise, strip_wake
+from hermes_voice.stt import is_noise, wake_match
 
 # ponytail: the meter keeps the newest 120 samples. Older levels are dropped.
 _METER_KEEP = 120
@@ -148,6 +148,7 @@ class VoiceApp(App[None]):
         retry_seconds: float = 5,
         speaker=None,
         gate=None,
+        wake_transcriber=None,
     ) -> None:
         super().__init__()
         self.client = client
@@ -155,6 +156,7 @@ class VoiceApp(App[None]):
         self.wake = wake
         self.mic = mic
         self.transcriber = transcriber
+        self.wake_transcriber = wake_transcriber
         self.segmenter = segmenter
         self.speaker = speaker
         self.gate = gate
@@ -275,8 +277,10 @@ class VoiceApp(App[None]):
         self._drop_waiting_audio()
 
     def _gate_busy(self) -> bool:
-        # A result stays busy until the UI accepts or drops it. A frame in that
-        # gap would otherwise expire the gate and lose the command.
+        # Room talk while asleep must not hold a reply. Once the gate is open,
+        # or when there is no gate, a result stays busy until the UI takes it.
+        if self.gate is not None and not self.gate.awake:
+            return False
         in_speech = self.segmenter is not None and self.segmenter.in_speech
         return (
             in_speech
@@ -284,13 +288,6 @@ class VoiceApp(App[None]):
             or self._transcribing
             or self._awaiting_transcript
         )
-
-    def _gated_frames(self, frame: bytes) -> tuple[list[bytes], bool]:
-        """Caller holds _audio_lock. Frames for the segmenter, and whether we just woke."""
-        if self.gate is None:
-            return [frame], False
-        was_awake = self.gate.awake
-        return self.gate.feed(frame), self.gate.awake and not was_awake
 
     def _on_ui(self, callback, *args, **kwargs) -> None:
         # ponytail: call_from_thread raises if the loop is already gone. Drop that race.
@@ -405,7 +402,6 @@ class VoiceApp(App[None]):
             return "started", None
 
     def _take_frame(self, frame: bytes) -> None:
-        bell = False
         with self._audio_lock:
             if self._speaking:
                 return
@@ -419,55 +415,52 @@ class VoiceApp(App[None]):
                 warn = False
             changed = False
             if not self._muted and self.segmenter is not None:
-                frames, woke = self._gated_frames(frame)
-                if woke:
-                    self.segmenter.reset()
-                    bell = True
+                utterance = self.segmenter.push(frame)
+                if utterance is not None:
+                    self._utterances.put((utterance, self._mute_gen))
+                    if self.gate is not None:
+                        self.gate.touch()
+                if self.gate is not None and self.gate.expire(self._gate_busy()):
                     changed = True
-                finished = False
-                for item in frames:
-                    utterance = self.segmenter.push(item)
-                    if utterance is not None:
-                        self._utterances.put((utterance, self._mute_gen))
-                        finished = True
-                if finished and self.gate is not None:
-                    self.gate.touch()
-                hearing = bool(self.segmenter.in_speech)
+                # Asleep stays "waiting" even while someone in the room is talking.
+                hearing = bool(self.segmenter.in_speech) and (
+                    self.gate is None or self.gate.awake
+                )
                 if hearing != self._hearing:
                     changed = True
                 self._hearing = hearing
-                if self.gate is not None and self.gate.expire(self._gate_busy()):
-                    changed = True
             elif not self._muted and self.gate is not None:
-                _, woke = self._gated_frames(frame)
-                if woke:
-                    bell = True
-                    changed = True
                 if self.gate.expire(self._gate_busy()):
                     changed = True
         if meter is not None:
             self._on_ui(self.set_level, meter)
         if warn:
             self._on_ui(self.log_line, MIC_SILENT_HINT)
-        if bell:
-            self._on_ui(self.bell)
         if changed:
             self._on_ui(self._sync_status)
 
     def _stt_loop(self) -> None:
         self._load_transcriber()
+        # Held aside so speech playback cannot drop a wake that arrived mid-transcription.
+        ahead: deque[tuple[bytes, int]] = deque()
         while not self._stop_audio.is_set():
-            try:
-                utterance, generation = self._utterances.get(timeout=_AUDIO_WAIT)
-            except queue.Empty:
-                continue
+            if ahead:
+                utterance, generation = ahead.popleft()
+            else:
+                try:
+                    utterance, generation = self._utterances.get(timeout=_AUDIO_WAIT)
+                except queue.Empty:
+                    continue
             if self._stop_audio.is_set():
                 break
             with self._audio_lock:
-                # A closed gate or a mute must not send audio that was already queued.
-                if generation != self._mute_gen or (
-                    self.gate is not None and not self.gate.awake
-                ):
+                if generation != self._mute_gen:
+                    continue
+                asleep = self.gate is not None and not self.gate.awake
+            if asleep and not self._open_if_wake(utterance, generation):
+                continue
+            with self._audio_lock:
+                if generation != self._mute_gen:
                     continue
                 self._transcribing = True
             self._on_ui(self._sync_status)
@@ -479,33 +472,63 @@ class VoiceApp(App[None]):
                 failed = True
                 self._on_ui(self.log_line, str(exc))
             deliver = not failed and not self._stop_audio.is_set() and not is_noise(text)
+            follow: list[tuple[bytes, int]] = []
             with self._audio_lock:
                 self._transcribing = False
                 if deliver:
                     self._awaiting_transcript = True
+                    follow = self._pull_queued()
             self._on_ui(self._sync_status)
             if deliver:
                 self._on_ui(self._deliver_transcript, text, generation)
+            if follow:
+                ahead.extendleft(reversed(follow))
+
+    def _open_if_wake(self, utterance: bytes, generation: int) -> bool:
+        """Hear one asleep utterance locally. True when the cloud should take it."""
+        failed = False
+        heard = ""
+        try:
+            if self.wake_transcriber is not None:
+                heard = self.wake_transcriber.transcribe(utterance)
+        except Exception as exc:
+            failed = True
+            self._on_ui(self.log_line, str(exc))
+        if failed:
+            return False
+        with self._audio_lock:
+            if generation != self._mute_gen or self.gate is None or self.gate.awake:
+                return False
+            remainder = wake_match(heard, self.wake or "")
+            if remainder is None:
+                return False
+            self.gate.wake()
+        self._on_ui(self.bell)
+        self._on_ui(self._sync_status)
+        return bool(remainder) and not is_noise(remainder)
 
     def _load_transcriber(self) -> None:
         self._loading = True
         self._on_ui(self._sync_status)
         logged: str | None = None
         try:
-            if self.transcriber is None:
-                return
-            while not self._stop_audio.is_set():
-                try:
-                    self.transcriber.load()
-                except Exception as exc:
-                    text = str(exc)
-                    if text != logged:
-                        logged = text
-                        self._on_ui(self.log_line, text)
-                    if not self._wait_for_stop(_LOAD_RETRY_SECONDS):
-                        return
+            for model in (self.transcriber, self.wake_transcriber):
+                if model is None:
                     continue
-                return
+                while not self._stop_audio.is_set():
+                    try:
+                        model.load()
+                    except Exception as exc:
+                        text = str(exc)
+                        if text != logged:
+                            logged = text
+                            self._on_ui(self.log_line, text)
+                        if not self._wait_for_stop(_LOAD_RETRY_SECONDS):
+                            return
+                        continue
+                    break
+                else:
+                    return
         finally:
             self._loading = False
             self._on_ui(self._sync_status)
@@ -528,12 +551,16 @@ class VoiceApp(App[None]):
             with self._audio_lock:
                 self._awaiting_transcript = False
 
-    def _drop_waiting_audio(self) -> None:
+    def _pull_queued(self) -> list[tuple[bytes, int]]:
+        items: list[tuple[bytes, int]] = []
         while True:
             try:
-                self._utterances.get_nowait()
+                items.append(self._utterances.get_nowait())
             except queue.Empty:
-                return
+                return items
+
+    def _drop_waiting_audio(self) -> None:
+        self._pull_queued()
 
     def on_transcript(self, text: str) -> None:
         if self._stop_sending:
@@ -546,10 +573,15 @@ class VoiceApp(App[None]):
             with self._audio_lock:
                 if not self.gate.awake:
                     return
-                spoken = strip_wake(text, self.wake or "")
+                matched = wake_match(text, self.wake or "")
+                spoken = text if matched is None else matched
                 if not spoken or is_noise(spoken):
                     return
-                self._close_gate()
+                # Queued audio stays. The local check gets the next wake.
+                self.gate.sleep()
+                if self.segmenter is not None:
+                    self.segmenter.reset()
+                self._hearing = False
             self._sync_status()
         log = self.query_one("#log", RichLog)
         if log.lines:
@@ -817,6 +849,7 @@ class VoiceApp(App[None]):
                 self._hearing = False
                 if self.gate is not None:
                     self.gate.sleep()
+                    self._drop_waiting_audio()
                 if self._stop_audio.is_set() or self._stop_speech.is_set():
                     self._speaking = False
                     return False

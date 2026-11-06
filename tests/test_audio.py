@@ -1,8 +1,12 @@
 import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace as NS
+
+import numpy as np
 import pytest
-from hermes_voice.audio import FRAME_BYTES, Mic, MicError, Segmenter, level
+
+from hermes_voice.audio import FRAME_BYTES, SAMPLE_RATE, Mic, MicError, Segmenter, SpeechDetector, level
 
 SPEECH, QUIET = b"\x01" * FRAME_BYTES, b"\x00" * FRAME_BYTES
 
@@ -248,6 +252,71 @@ def test_play_closes_the_stream_when_chunks_raise(monkeypatch):
     with pytest.raises(RuntimeError, match="broken"):
         play(chunks(), threading.Event())
     assert streams[0].calls[-1] == "close"
+
+
+_FIXTURE = Path(__file__).parent / "fixtures" / "hey_hermes.pcm"
+
+
+def _noise(seconds):
+    # Seeded room hiss. RMS lands near 0.007, under a speech detector's threshold.
+    rng = np.random.default_rng(0)
+    samples = rng.normal(0, 0.007 * 32768, int(SAMPLE_RATE * seconds))
+    return np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
+
+
+def _feed(segmenter, pcm):
+    finished = []
+    for offset in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES):
+        utterance = segmenter.push(pcm[offset : offset + FRAME_BYTES])
+        if utterance is not None:
+            finished.append(utterance)
+    return finished
+
+
+def _frames(pcm):
+    return [
+        pcm[offset : offset + FRAME_BYTES]
+        for offset in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES)
+    ]
+
+
+def test_detector_finds_real_speech():
+    detector = SpeechDetector()
+    assert any(detector(frame) for frame in _frames(_FIXTURE.read_bytes()))
+
+
+def test_detector_ignores_silence_and_noise():
+    detector = SpeechDetector()
+    silence = b"\x00" * (SAMPLE_RATE * 3 * 2)
+    assert not any(detector(frame) for frame in _frames(silence))
+    detector.reset()
+    assert not any(detector(frame) for frame in _frames(_noise(3)))
+
+
+def test_detector_buffers_480_sample_frames():
+    detector = SpeechDetector()
+    frame = bytes((index * 17) % 256 for index in range(FRAME_BYTES))
+    for _ in range(100):
+        assert detector(frame) in (True, False)
+
+
+def test_detector_reset_clears_state():
+    detector = SpeechDetector()
+    frames = _frames(_FIXTURE.read_bytes())
+    assert any(detector(frame) for frame in frames)
+    detector.reset()
+    assert detector(frames[0]) is False
+
+
+def test_utterance_ends_in_a_noisy_room():
+    speech = _FIXTURE.read_bytes()
+    noise = np.frombuffer(_noise(len(speech) / 2 / SAMPLE_RATE), np.int16).astype(np.int32)
+    audio = np.frombuffer(speech, np.int16).astype(np.int32)
+    mixed = np.clip(audio + noise[: len(audio)], -32768, 32767).astype(np.int16).tobytes()
+    pcm = _noise(1) + mixed + _noise(2)
+    utterances = _feed(Segmenter(SpeechDetector()), pcm)
+    assert len(utterances) == 1
+    assert len(utterances[0]) / 2 / SAMPLE_RATE < 5
 
 
 def test_device_that_cannot_open_points_to_list_devices(monkeypatch):

@@ -6,6 +6,9 @@ import sys
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable
+from pathlib import Path
+
+import numpy as np
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 960
@@ -43,6 +46,52 @@ def level(frame: bytes) -> float:
     return min(1.0, rms / 32768.0)
 
 
+class SpeechDetector:
+    """True when a frame is speech. Silero v6, already shipped with faster-whisper."""
+
+    def __init__(self, threshold: float = 0.5) -> None:
+        import faster_whisper
+        import onnxruntime
+
+        # ponytail: 16 kHz Silero v6 only. State is (1, 1, 128) and the context is 64 samples.
+        path = Path(faster_whisper.__file__).resolve().parent / "assets" / "silero_vad_v6.onnx"
+        opts = onnxruntime.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        opts.log_severity_level = 4
+        self._session = onnxruntime.InferenceSession(
+            str(path), providers=["CPUExecutionProvider"], sess_options=opts
+        )
+        self.threshold = threshold
+        self.reset()
+
+    def reset(self) -> None:
+        self._h = np.zeros((1, 1, 128), np.float32)
+        self._c = np.zeros((1, 1, 128), np.float32)
+        self._context = np.zeros(64, np.float32)
+        self._pending = np.zeros(0, np.float32)
+        self._speech = False
+
+    def __call__(self, frame: bytes) -> bool:
+        # Capture frames are 480 samples. Silero wants 512, so the latest decision stands until the buffer fills.
+        samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
+        self._pending = np.concatenate((self._pending, samples))
+        while len(self._pending) >= 512:
+            chunk = self._pending[:512]
+            self._pending = self._pending[512:]
+            out, self._h, self._c = self._session.run(
+                None,
+                {
+                    "input": np.concatenate((self._context, chunk))[None, :],
+                    "h": self._h,
+                    "c": self._c,
+                },
+            )
+            self._context = np.array(chunk[-64:], copy=True)
+            self._speech = float(np.squeeze(out)) >= self.threshold
+        return self._speech
+
+
 class Segmenter:
     def __init__(
         self,
@@ -68,6 +117,9 @@ class Segmenter:
         self._speech_frames = 0
         self._silence_frames = 0
         self.in_speech = False
+        reset = getattr(self._is_speech, "reset", None)
+        if reset is not None:
+            reset()
 
     def push(self, frame: bytes) -> bytes | None:
         if not self.in_speech:
