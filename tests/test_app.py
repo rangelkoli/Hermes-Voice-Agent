@@ -307,6 +307,9 @@ class FakeMic:
         self.alive = False
         self.frames.clear()
 
+    def clear(self) -> None:
+        self.frames.clear()
+
     def read(self, timeout: float = 0.1) -> bytes | None:
         self.reads += 1
         if self.alive and self.frames:
@@ -1033,6 +1036,221 @@ def test_quit_stops_speech():
         assert speaker.stop_events[0].is_set()
         await asyncio.to_thread(app._speak_thread.join, 1.0)
         assert not app._speak_thread.is_alive()
+    run(go)
+
+
+def test_esc_while_waiting_for_the_user_cancels_the_reply():
+    class Talking:
+        def __init__(self):
+            self.in_speech = True
+
+        def push(self, frame):
+            del frame
+            return None
+
+        def reset(self):
+            return None
+
+    class TwoRuns(FakeClient):
+        def __init__(self):
+            super().__init__(hold=True)
+            self.calls = 0
+
+        async def events(self, run_id: str):
+            del run_id
+            self.calls += 1
+            if self.calls == 1:
+                yield RunEvent("run.completed", {"output": "Ready."})
+                return
+            need = self._released + 1
+            while self._released < need and not self._closed:
+                self._wake.clear()
+                if self._released >= need or self._closed:
+                    return
+                await self._wake.wait()
+
+    async def go():
+        segmenter = Talking()
+        speaker = FakeSpeaker()
+        c = TwoRuns()
+        app = VoiceApp(c, "voice-test", speaker=speaker, segmenter=segmenter)
+        async with app.run_test() as pilot:
+            app.on_transcript("first")
+            await until(
+                lambda: c.started == ["first"] and app._run_id is None and app._speech.empty()
+            )
+            await asyncio.sleep(0.15)
+            assert speaker.spoke == []
+            app.on_transcript("second")
+            await until(lambda: app._run_id is not None)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert c.stops == []
+            segmenter.in_speech = False
+            await asyncio.sleep(0.4)
+            assert speaker.spoke == []
+    run(go)
+
+
+def test_speech_keeps_waiting_if_talking_starts_before_playback():
+    class Race:
+        def __init__(self):
+            self._talking = False
+            self._armed = False
+            self.reset_while_talking = False
+            self.quiet_seen = threading.Event()
+            self.release = threading.Event()
+
+        @property
+        def in_speech(self):
+            if not self._armed:
+                self._armed = True
+                self.quiet_seen.set()
+                self.release.wait(2)
+                self._talking = True
+                return False
+            return self._talking
+
+        def push(self, frame):
+            del frame
+            return None
+
+        def reset(self):
+            if self._talking:
+                self.reset_while_talking = True
+            self._talking = False
+
+    async def go():
+        segmenter = Race()
+        speaker = FakeSpeaker()
+        c = FakeClient(script=[RunEvent("run.completed", {"output": "Ready."})])
+        app = VoiceApp(c, "voice-test", speaker=speaker, segmenter=segmenter)
+        async with app.run_test() as pilot:
+            del pilot
+            app.on_transcript("go")
+            await until(lambda: segmenter.quiet_seen.is_set())
+            segmenter.release.set()
+            await asyncio.sleep(0.2)
+            assert speaker.spoke == []
+            assert segmenter.reset_while_talking is False
+            segmenter._talking = False
+            await until(lambda: speaker.spoke == ["Ready."])
+    run(go)
+
+
+class _BacklogMic(FakeMic):
+    def __init__(self):
+        super().__init__()
+        self.backlog: list[bytes] = []
+        self.release = threading.Event()
+
+    def read(self, timeout: float = 0.1) -> bytes | None:
+        del timeout
+        self.reads += 1
+        if self.alive and self.frames:
+            return self.frames.pop(0)
+        if self.release.is_set() and self.backlog:
+            return self.backlog.pop(0)
+        time.sleep(0.01)
+        return None
+
+    def clear(self) -> None:
+        super().clear()
+        self.backlog.clear()
+
+
+def test_frames_queued_before_the_tail_ends_never_reach_the_segmenter():
+    async def go():
+        mic = _BacklogMic()
+        segmenter = _CountingSegmenter()
+        speaker = FakeSpeaker(hold=True)
+        c = FakeClient(script=[RunEvent("run.completed", {"output": "Hello."})])
+        app = VoiceApp(
+            c,
+            "voice-test",
+            mic=mic,
+            transcriber=FakeTranscriber([]),
+            segmenter=segmenter,
+            speaker=speaker,
+        )
+        async with app.run_test() as pilot:
+            del pilot
+            app.on_transcript("go")
+            await until(lambda: app._speaking)
+            mic.backlog.extend([_SPEECH] * 10)
+            seen = segmenter.pushes
+            speaker.release.set()
+            await until(lambda: app._speaking is False, timeout=2)
+            mic.release.set()
+            await asyncio.sleep(0.2)
+            assert segmenter.pushes == seen
+            assert mic.backlog == []
+    run(go)
+
+
+def test_discarded_frames_set_the_meter_to_zero_once():
+    async def go():
+        mic = FakeMic()
+        speaker = FakeSpeaker(hold=True)
+        c = FakeClient(script=[RunEvent("run.completed", {"output": "Hello."})])
+        app = VoiceApp(
+            c,
+            "voice-test",
+            mic=mic,
+            transcriber=FakeTranscriber([]),
+            segmenter=_CountingSegmenter(),
+            speaker=speaker,
+        )
+        levels: list[float] = []
+
+        def record(value):
+            levels.append(value)
+            VoiceApp.set_level(app, value)
+
+        app.set_level = record
+        async with app.run_test() as pilot:
+            app.on_transcript("go")
+            await until(lambda: app.status == "speaking" and levels == [0.0])
+            mic.frames.extend([_SPEECH] * 20)
+            await until(lambda: not mic.frames and mic.reads >= 5)
+            await pilot.pause()
+            assert levels == [0.0]
+            speaker.release.set()
+    run(go)
+
+
+def test_quit_during_playback_start_does_not_clear_stop():
+    class Segmenter:
+        def __init__(self):
+            self.in_speech = False
+            self.app = None
+            self.resets = 0
+
+        def push(self, frame):
+            del frame
+            return None
+
+        def reset(self):
+            self.resets += 1
+            if self.resets == 1 and self.app is not None:
+                self.app._stop_speech.set()
+                self.app._stop_audio.set()
+
+    async def go():
+        segmenter = Segmenter()
+        speaker = FakeSpeaker()
+        c = FakeClient(script=[RunEvent("run.completed", {"output": "Bye."})])
+        app = VoiceApp(c, "voice-test", speaker=speaker, segmenter=segmenter)
+        segmenter.app = app
+        async with app.run_test() as pilot:
+            del pilot
+            app.on_transcript("go")
+            await until(lambda: segmenter.resets >= 1)
+            await asyncio.sleep(0.1)
+            if speaker.stop_events:
+                assert speaker.stop_events[0].is_set()
+            else:
+                assert app._stop_speech.is_set()
     run(go)
 
 

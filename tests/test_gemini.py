@@ -1,8 +1,11 @@
 import base64
 import io
 import json
+import sys
+import threading
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -283,3 +286,65 @@ def test_default_key_file_is_under_config_home(tmp_path, monkeypatch):
     with pytest.raises(GeminiError) as exc:
         load_gemini_key()
     assert str(tmp_path / ".config" / "hermes-voice" / ".env") in str(exc.value)
+
+
+def test_stop_unblocks_a_stalled_speech_read(monkeypatch):
+    started = threading.Event()
+
+    class _Stream(httpx.SyncByteStream):
+        def __init__(self):
+            self._closed = threading.Event()
+
+        def __iter__(self):
+            started.set()
+            if not self._closed.wait(5):
+                raise AssertionError("stream was not closed")
+            raise httpx.ReadError("closed")
+            yield b""
+
+        def close(self):
+            self._closed.set()
+
+    class _Transport(httpx.BaseTransport):
+        def handle_request(self, request):
+            del request
+            return httpx.Response(200, stream=_Stream())
+
+    class _Out:
+        def start(self):
+            return None
+
+        def write(self, data):
+            del data
+
+        def stop(self):
+            return None
+
+        def abort(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        SimpleNamespace(RawOutputStream=lambda **_kwargs: _Out()),
+    )
+    speaker = GeminiSpeaker(_KEY, transport=_Transport())
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def run():
+        try:
+            speaker.say("Hello", stop)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    assert started.wait(2)
+    stop.set()
+    thread.join(1)
+    assert not thread.is_alive()
+    assert errors == []

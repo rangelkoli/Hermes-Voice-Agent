@@ -203,6 +203,9 @@ class Mic:
             self._stream = None
         if stream is not None:
             stream.close()
+        self.clear()
+
+    def clear(self) -> None:
         while True:
             try:
                 self._queue.get_nowait()

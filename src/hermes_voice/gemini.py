@@ -182,8 +182,13 @@ class GeminiSpeaker:
         self.voice = voice
         self._api_key = api_key
         self._client = _client(api_key, transport)
+        self._stop: threading.Event | None = None
+        self._response: httpx.Response | None = None
+        self._response_lock = threading.Lock()
 
     def stream(self, text: str) -> Iterator[bytes]:
+        if self._stop is not None and self._stop.is_set():
+            return
         body = {
             "model": self.model,
             "stream": True,
@@ -196,26 +201,79 @@ class GeminiSpeaker:
             "generation_config": {"speech_config": [{"voice": self.voice}]},
         }
         with self._client.stream("POST", "/interactions", json=body) as response:
-            if response.status_code >= 400:
-                response.read()
-                raise GeminiError(_error_text(response, self._api_key))
-            for line in response.iter_lines():
-                if not line.startswith("data:"):
-                    continue
-                raw = line[5:].strip()
-                if not raw:
-                    continue
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                delta = event.get("delta")
-                if not isinstance(delta, dict) or delta.get("type") != "audio":
-                    continue
-                data = delta.get("data")
-                if not data:
-                    continue
-                yield base64.b64decode(data)
+            self._attach(response)
+            try:
+                if response.status_code >= 400:
+                    response.read()
+                    raise GeminiError(_error_text(response, self._api_key))
+                for line in response.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw:
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = event.get("delta")
+                    if not isinstance(delta, dict) or delta.get("type") != "audio":
+                        continue
+                    data = delta.get("data")
+                    if not data:
+                        continue
+                    yield base64.b64decode(data)
+            finally:
+                self._detach(response)
 
     def say(self, text: str, stop: threading.Event) -> None:
-        play(self.stream(text), stop)
+        if stop.is_set():
+            return
+        done = threading.Event()
+        self._stop = stop
+        watcher = threading.Thread(
+            target=self._close_when_stopped,
+            args=(stop, done),
+            name="gemini-stop",
+            daemon=True,
+        )
+        watcher.start()
+        try:
+            play(self.stream(text), stop)
+        except Exception:
+            if not stop.is_set():
+                raise
+        finally:
+            done.set()
+            self._stop = None
+            self._detach(None)
+            watcher.join(0.2)
+
+    def _attach(self, response: httpx.Response) -> None:
+        with self._response_lock:
+            self._response = response
+            stopped = self._stop is not None and self._stop.is_set()
+        if stopped:
+            response.close()
+
+    def _detach(self, response: httpx.Response | None) -> None:
+        with self._response_lock:
+            if response is None or self._response is response:
+                self._response = None
+
+    def _close_when_stopped(self, stop: threading.Event, done: threading.Event) -> None:
+        while not done.is_set():
+            if stop.wait(0.05):
+                break
+        if done.is_set() or not stop.is_set():
+            return
+        with self._response_lock:
+            if done.is_set():
+                return
+            response = self._response
+        if response is None:
+            return
+        try:
+            response.close()
+        except Exception:
+            return
