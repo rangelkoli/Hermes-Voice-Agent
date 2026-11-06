@@ -5,7 +5,7 @@ import queue
 import sys
 import threading
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 960
@@ -238,6 +238,30 @@ class Mic:
             self._queue.put_nowait(bytes(indata))
         except queue.Full:
             return
+
+
+def play(chunks: Iterable[bytes], stop: threading.Event) -> None:
+    # ponytail: stop is checked between chunks. A stalled read waits out the client timeout.
+    sd = _sounddevice()
+    stream = sd.RawOutputStream(samplerate=24000, channels=1, dtype="int16")
+    pending = b""
+    try:
+        stream.start()
+        for chunk in chunks:
+            if stop.is_set():
+                stream.abort()
+                return
+            pending += bytes(chunk)
+            even = len(pending) - (len(pending) % 2)
+            if even:
+                stream.write(pending[:even])
+                pending = pending[even:]
+        if stop.is_set():
+            stream.abort()
+            return
+        stream.stop()
+    finally:
+        stream.close()
 
 
 def _sounddevice():

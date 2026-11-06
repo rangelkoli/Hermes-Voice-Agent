@@ -10,6 +10,7 @@ import webrtcvad
 
 from hermes_voice.app import VoiceApp
 from hermes_voice.audio import SAMPLE_RATE, Mic, MicError, Segmenter, list_devices
+from hermes_voice.gemini import GeminiError, GeminiSpeaker, GeminiTranscriber, load_gemini_key
 from hermes_voice.hermes import HermesAuthError, HermesClient, load_api_key
 from hermes_voice.stt import Transcriber
 
@@ -36,7 +37,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--wake")
     parser.add_argument("--device", type=_device)
     parser.add_argument("--list-devices", action="store_true")
-    parser.add_argument("--stt-model", default="small.en")
+    parser.add_argument("--local", action="store_true")
+    parser.add_argument("--stt-model")
+    parser.add_argument("--tts-model", default="gemini-3.8-flash-lite-tts")
+    parser.add_argument("--voice", default="Kore")
     parser.add_argument("--vad-level", type=int, choices=(0, 1, 2, 3), default=2)
     parser.add_argument("--end-silence-ms", type=_end_silence_ms, default=1000)
     args = parser.parse_args(argv)
@@ -69,6 +73,19 @@ def main(argv: list[str] | None = None) -> None:
 
     vad = webrtcvad.Vad(args.vad_level)
     is_speech = lambda f: vad.is_speech(f, SAMPLE_RATE)
+    if args.local:
+        stt_model = args.stt_model or "small.en"
+        transcriber = Transcriber(stt_model)
+        speaker = None
+    else:
+        stt_model = args.stt_model or "gemini-3.5-transcribe"
+        try:
+            gemini_key = load_gemini_key()
+        except GeminiError as exc:
+            print(exc, file=sys.stderr)
+            raise SystemExit(1) from None
+        transcriber = GeminiTranscriber(gemini_key, model=stt_model)
+        speaker = GeminiSpeaker(gemini_key, model=args.tts_model, voice=args.voice)
     # Textual replaces sys.stderr with an object whose fileno() is -1. Loading Whisper makes
     # tqdm start this tracker, which passes that fd to its child and fails with "bad value(s)
     # in fds_to_keep". Starting it here, while stderr is real, avoids that.
@@ -78,6 +95,7 @@ def main(argv: list[str] | None = None) -> None:
         datetime.now().strftime("voice-%Y%m%d-%H%M%S"),
         wake=args.wake,
         mic=Mic(args.device),
-        transcriber=Transcriber(args.stt_model),
+        transcriber=transcriber,
         segmenter=Segmenter(is_speech, end_silence_ms=args.end_silence_ms),
+        speaker=speaker,
     ).run()

@@ -30,6 +30,7 @@ def _silence_health(monkeypatch, status=200):
 def _ready(monkeypatch, tmp_path, *, health=200):
     monkeypatch.delenv("HERMES_API_KEY", raising=False)
     monkeypatch.setenv("HERMES_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-test-key")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("hermes_voice.__main__.Mic.check", lambda self: None)
     return _silence_health(monkeypatch, health)
@@ -126,7 +127,7 @@ def test_default_flags_reach_constructors(monkeypatch, tmp_path):
     app = found["app"]
     assert modes == [2]
     assert app.segmenter._end_silence_ms == 1000
-    assert app.transcriber.model == "small.en"
+    assert app.transcriber.model == "gemini-3.5-transcribe"
     assert app.mic._device is None
     assert app.wake is None
     assert re.fullmatch(r"voice-\d{8}-\d{6}", app.session_id)
@@ -213,9 +214,83 @@ cli.main()
 """
 
 
+def test_default_mode_builds_gemini_clients(monkeypatch, tmp_path):
+    from hermes_voice.gemini import GeminiSpeaker, GeminiTranscriber
+
+    _ready(monkeypatch, tmp_path)
+    found, _modes, _rates = _capture_app(monkeypatch)
+
+    main([])
+
+    app = found["app"]
+    assert isinstance(app.transcriber, GeminiTranscriber)
+    assert isinstance(app.speaker, GeminiSpeaker)
+    assert app.transcriber.model == "gemini-3.5-transcribe"
+    assert app.speaker.model == "gemini-3.8-flash-lite-tts"
+    assert app.speaker.voice == "Kore"
+    assert app.transcriber._client.headers["x-goog-api-key"] == "gem-test-key"
+    assert "gem-test-key" not in str(app.transcriber._client.base_url)
+    assert app.speaker._client.trust_env is False
+
+
+def test_local_uses_whisper_and_no_speaker_and_needs_no_key(monkeypatch, tmp_path):
+    import pathlib
+
+    from hermes_voice.stt import Transcriber
+
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    _ready(monkeypatch, tmp_path)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    found, _modes, _rates = _capture_app(monkeypatch)
+
+    main(["--local"])
+
+    app = found["app"]
+    assert isinstance(app.transcriber, Transcriber)
+    assert app.transcriber.model == "small.en"
+    assert app.speaker is None
+
+
+def test_missing_gemini_key_exits_1_with_the_message(monkeypatch, capsys, tmp_path):
+    import pathlib
+
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    _ready(monkeypatch, tmp_path)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    _capture_app(monkeypatch)
+
+    with pytest.raises(SystemExit) as exc:
+        main([])
+
+    assert exc.value.code == 1
+    text = capsys.readouterr().err
+    expected = tmp_path / ".config" / "hermes-voice" / ".env"
+    assert str(expected) in text
+    assert "aistudio.google.com/apikey" in text
+    assert "--local" in text
+    assert "Traceback" not in text
+    assert "gem-test-key" not in text
+
+
+def test_voice_and_model_flags_reach_the_speaker(monkeypatch, tmp_path):
+    _ready(monkeypatch, tmp_path)
+    found, _modes, _rates = _capture_app(monkeypatch)
+
+    main([
+        "--tts-model", "gemini-custom-tts",
+        "--voice", "Puck",
+        "--stt-model", "gemini-custom-stt",
+    ])
+
+    app = found["app"]
+    assert app.transcriber.model == "gemini-custom-stt"
+    assert app.speaker.model == "gemini-custom-tts"
+    assert app.speaker.voice == "Puck"
+
+
 def test_multiprocessing_lock_works_inside_the_ui():
     # Needs a fresh process: the tracker is global, so an earlier test could hide the bug.
-    env = {**os.environ, "HERMES_API_KEY": "test-key"}
+    env = {**os.environ, "HERMES_API_KEY": "test-key", "GEMINI_API_KEY": "test-gemini-key"}
     done = subprocess.run(
         [sys.executable, "-c", _LOCK_INSIDE_UI], env=env, capture_output=True, text=True, timeout=60
     )

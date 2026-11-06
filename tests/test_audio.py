@@ -1,4 +1,5 @@
 import sys
+import threading
 from types import SimpleNamespace as NS
 import pytest
 from hermes_voice.audio import FRAME_BYTES, Mic, MicError, Segmenter, level
@@ -117,6 +118,100 @@ def test_alive_is_false_when_the_stream_check_fails(monkeypatch):
     stream.fail = True
     assert mic.alive is False
     mic.stop()
+
+
+class _RecordingStream:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.writes: list[bytes] = []
+        self.calls: list[str] = []
+
+    def start(self):
+        self.calls.append("start")
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+        self.calls.append("write")
+
+    def stop(self):
+        self.calls.append("stop")
+
+    def abort(self):
+        self.calls.append("abort")
+
+    def close(self):
+        self.calls.append("close")
+
+
+def _output_device(monkeypatch):
+    streams = []
+
+    def open_stream(**kwargs):
+        stream = _RecordingStream(**kwargs)
+        streams.append(stream)
+        return stream
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        NS(PortAudioError=type("PortAudioError", (Exception,), {}), RawOutputStream=open_stream),
+    )
+    return streams
+
+
+def test_play_writes_chunks_at_24khz_then_drains(monkeypatch):
+    from hermes_voice.audio import play
+
+    streams = _output_device(monkeypatch)
+    play([b"\x00\x01" * 4], threading.Event())
+    stream = streams[0]
+    assert stream.kwargs["samplerate"] == 24000
+    assert stream.kwargs["channels"] == 1
+    assert stream.kwargs["dtype"] == "int16"
+    assert stream.writes == [b"\x00\x01" * 4]
+    assert stream.calls == ["start", "write", "stop", "close"]
+
+
+def test_play_holds_back_an_odd_trailing_byte(monkeypatch):
+    from hermes_voice.audio import play
+
+    streams = _output_device(monkeypatch)
+    play([b"abc", b"d"], threading.Event())
+    assert streams[0].writes == [b"ab", b"cd"]
+
+
+def test_play_aborts_when_stop_is_set(monkeypatch):
+    from hermes_voice.audio import play
+
+    streams = _output_device(monkeypatch)
+    stop = threading.Event()
+
+    def chunks():
+        yield b"\x00\x01"
+        stop.set()
+        yield b"\x02\x03"
+        yield b"\x04\x05"
+
+    play(chunks(), stop)
+    stream = streams[0]
+    assert stream.writes == [b"\x00\x01"]
+    assert "abort" in stream.calls
+    assert "stop" not in stream.calls
+    assert stream.calls[-1] == "close"
+
+
+def test_play_closes_the_stream_when_chunks_raise(monkeypatch):
+    from hermes_voice.audio import play
+
+    streams = _output_device(monkeypatch)
+
+    def chunks():
+        yield b"\x00\x01"
+        raise RuntimeError("broken")
+
+    with pytest.raises(RuntimeError, match="broken"):
+        play(chunks(), threading.Event())
+    assert streams[0].calls[-1] == "close"
 
 
 def test_device_that_cannot_open_points_to_list_devices(monkeypatch):
