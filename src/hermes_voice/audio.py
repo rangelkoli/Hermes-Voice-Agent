@@ -134,7 +134,11 @@ def list_devices() -> str:
     try:
         devices = sd.query_devices()
     except (sd.PortAudioError, ValueError) as exc:
-        raise _device_error(exc) from exc
+        # This command is already --list-devices, so don't send the user back to it.
+        raise MicError(
+            "A local microphone is required. SSH sessions and headless machines "
+            f"have none. ({exc})"
+        ) from exc
     lines = [
         f"{index}: {info['name']}"
         for index, info in enumerate(devices)
