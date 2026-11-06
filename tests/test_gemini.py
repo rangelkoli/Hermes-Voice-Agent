@@ -288,43 +288,42 @@ def test_default_key_file_is_under_config_home(tmp_path, monkeypatch):
     assert str(tmp_path / ".config" / "hermes-voice" / ".env") in str(exc.value)
 
 
-def test_stop_unblocks_a_stalled_speech_read(monkeypatch):
+class _Out:
+    def start(self):
+        return None
+
+    def write(self, data):
+        del data
+
+    def stop(self):
+        return None
+
+    def abort(self):
+        return None
+
+    def close(self):
+        return None
+
+
+@pytest.mark.parametrize("stall", ["request", "body"])
+def test_stop_ends_speech_during_a_stalled_network_call(monkeypatch, stall):
+    # The stall ignores close(), like a blocked TLS read on macOS.
     started = threading.Event()
+    release = threading.Event()
 
     class _Stream(httpx.SyncByteStream):
-        def __init__(self):
-            self._closed = threading.Event()
-
         def __iter__(self):
             started.set()
-            if not self._closed.wait(5):
-                raise AssertionError("stream was not closed")
-            raise httpx.ReadError("closed")
+            release.wait(5)
             yield b""
-
-        def close(self):
-            self._closed.set()
 
     class _Transport(httpx.BaseTransport):
         def handle_request(self, request):
             del request
+            if stall == "request":
+                started.set()
+                release.wait(5)
             return httpx.Response(200, stream=_Stream())
-
-    class _Out:
-        def start(self):
-            return None
-
-        def write(self, data):
-            del data
-
-        def stop(self):
-            return None
-
-        def abort(self):
-            return None
-
-        def close(self):
-            return None
 
     monkeypatch.setitem(
         sys.modules,
@@ -346,5 +345,19 @@ def test_stop_unblocks_a_stalled_speech_read(monkeypatch):
     assert started.wait(2)
     stop.set()
     thread.join(1)
-    assert not thread.is_alive()
+    alive = thread.is_alive()
+    release.set()
+    assert not alive
     assert errors == []
+
+
+def test_say_raises_a_speech_failure(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        SimpleNamespace(RawOutputStream=lambda **_kwargs: _Out()),
+    )
+    transport = httpx.MockTransport(lambda request: httpx.Response(403, json={"error": {"message": "denied"}}))
+    speaker = GeminiSpeaker(_KEY, transport=transport)
+    with pytest.raises(GeminiError, match="denied"):
+        speaker.say("Hello", threading.Event())

@@ -244,7 +244,6 @@ class Mic:
 
 
 def play(chunks: Iterable[bytes], stop: threading.Event) -> None:
-    # ponytail: stop is checked between chunks. A stalled read waits out the client timeout.
     sd = _sounddevice()
     stream = sd.RawOutputStream(samplerate=24000, channels=1, dtype="int16")
     pending = b""
