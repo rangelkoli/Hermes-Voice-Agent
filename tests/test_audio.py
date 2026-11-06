@@ -77,6 +77,48 @@ def test_stop_discards_audio_still_in_the_queue(monkeypatch):
     assert mic.read(timeout=0) is None
 
 
+def test_alive_is_false_when_the_stream_check_fails(monkeypatch):
+    class PortAudioError(Exception):
+        pass
+
+    class Stream:
+        def __init__(self):
+            self.fail = False
+
+        def start(self):
+            return None
+
+        def close(self):
+            return None
+
+        @property
+        def active(self):
+            if self.fail:
+                raise PortAudioError("stream closed")
+            return True
+
+    stream = Stream()
+
+    def open_stream(**kwargs):
+        del kwargs
+        return stream
+
+    fake = NS(
+        PortAudioError=PortAudioError,
+        RawInputStream=open_stream,
+        _terminate=lambda: None,
+        _initialize=lambda: None,
+        query_devices=lambda device=None, kind=None: {"name": "Fake Mic", "max_input_channels": 1},
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", fake)
+    mic = Mic()
+    mic.start()
+    assert mic.alive is True
+    stream.fail = True
+    assert mic.alive is False
+    mic.stop()
+
+
 def test_device_that_cannot_open_points_to_list_devices(monkeypatch):
     class PortAudioError(Exception):
         pass

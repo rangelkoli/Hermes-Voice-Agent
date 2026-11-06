@@ -215,7 +215,12 @@ class Mic:
     def alive(self) -> bool:
         with self._lock:
             stream = self._stream
-        return stream is not None and bool(stream.active)
+            if stream is None:
+                return False
+            try:
+                return bool(stream.active)
+            except Exception:
+                return False
 
     @property
     def name(self) -> str:

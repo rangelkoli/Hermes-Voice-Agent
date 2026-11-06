@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 from collections import deque
+from concurrent.futures import CancelledError
 
 import httpx
 from rich.markdown import Markdown
@@ -23,6 +24,8 @@ from hermes_voice.stt import apply_wake, is_noise
 _METER_KEEP = 120
 # ponytail: a dead mic is reopened after a fixed 2 seconds. Quit and mute return early.
 _MIC_RETRY_SECONDS = 2.0
+# ponytail: a failed model download is retried after a fixed 5 seconds. Quit returns early.
+_LOAD_RETRY_SECONDS = 5.0
 _AUDIO_WAIT = 0.1
 _SILENT_FRAMES = 100
 
@@ -152,7 +155,7 @@ class VoiceApp(App[None]):
         self._zero_frames = 0
         self._frame_count = 0
         self._logged_mic_errors: set[str] = set()
-        self._utterances: queue.Queue[bytes] = queue.Queue()
+        self._utterances: queue.Queue[tuple[bytes, int]] = queue.Queue()
         self._stop_audio = threading.Event()
         self._audio_lock = threading.Lock()
         self._capture_thread: threading.Thread | None = None
@@ -221,7 +224,7 @@ class VoiceApp(App[None]):
             return
         try:
             self.call_from_thread(callback, *args, **kwargs)
-        except RuntimeError:
+        except (RuntimeError, CancelledError):
             return
         except Exception:
             if self._quit or not self.is_running:
@@ -234,18 +237,36 @@ class VoiceApp(App[None]):
     def _capture_loop(self) -> None:
         try:
             while not self._stop_audio.is_set():
-                if self._muted:
-                    self._stop_audio.wait(_AUDIO_WAIT)
-                    continue
-                if not self.mic.alive:
-                    self._recover_mic()
-                    continue
-                frame = self.mic.read(_AUDIO_WAIT)
-                if frame is None or self._muted or self._stop_audio.is_set():
-                    continue
-                self._take_frame(frame)
+                try:
+                    self._capture_once()
+                except Exception as exc:
+                    self._capture_failed(exc)
         finally:
             self.mic.stop()
+
+    def _capture_once(self) -> None:
+        if self._muted:
+            self._stop_audio.wait(_AUDIO_WAIT)
+            return
+        if not self.mic.alive:
+            self._recover_mic()
+            return
+        frame = self.mic.read(_AUDIO_WAIT)
+        if frame is None or self._muted or self._stop_audio.is_set():
+            return
+        self._take_frame(frame)
+
+    def _capture_failed(self, exc: Exception) -> None:
+        text = str(exc)
+        with self._audio_lock:
+            self._mic_lost = True
+            fresh = bool(text) and text not in self._logged_mic_errors
+            if fresh:
+                self._logged_mic_errors.add(text)
+        self._on_ui(self._sync_status)
+        if fresh:
+            self._on_ui(self.log_line, text)
+        self._stop_audio.wait(_AUDIO_WAIT)
 
     def _recover_mic(self) -> None:
         if self._muted or self._stop_audio.is_set():
@@ -257,15 +278,11 @@ class VoiceApp(App[None]):
                 return
         outcome, message = self._try_start()
         if outcome == "started":
-            self._mic_lost = False
             self._on_ui(self._sync_status)
             self._on_ui(self._repaint)
         elif outcome == "alive":
-            if self._mic_lost:
-                self._mic_lost = False
-                self._on_ui(self._sync_status)
+            self._on_ui(self._sync_status)
         elif outcome == "lost":
-            self._mic_lost = True
             self._on_ui(self._sync_status)
             if message:
                 self._on_ui(self.log_line, message)
@@ -288,6 +305,9 @@ class VoiceApp(App[None]):
             if self._muted or self._stop_audio.is_set():
                 return "skip", None
             if self.mic.alive:
+                if not self._mic_lost:
+                    return "skip", None
+                self._mic_lost = False
                 return "alive", None
             try:
                 self.mic.start()
@@ -297,9 +317,11 @@ class VoiceApp(App[None]):
                     self._logged_mic_errors.add(text)
                     message = text
                 self._retry_mic = True
+                self._mic_lost = True
                 return "lost", message
             self._retry_mic = True
-        return "started", None
+            self._mic_lost = False
+            return "started", None
 
     def _take_frame(self, frame: bytes) -> None:
         self._frame_count += 1
@@ -319,40 +341,70 @@ class VoiceApp(App[None]):
             changed = hearing != self._hearing
             self._hearing = hearing
             if utterance is not None:
-                self._utterances.put(utterance)
+                self._utterances.put((utterance, self._mute_gen))
         if changed:
             self._on_ui(self._sync_status)
 
     def _stt_loop(self) -> None:
-        self._loading = True
-        self._on_ui(self._sync_status)
-        try:
-            if self.transcriber is not None:
-                self.transcriber.load()
-        finally:
-            self._loading = False
-            self._on_ui(self._sync_status)
+        self._load_transcriber()
         while not self._stop_audio.is_set():
             try:
-                utterance = self._utterances.get(timeout=_AUDIO_WAIT)
+                utterance, generation = self._utterances.get(timeout=_AUDIO_WAIT)
             except queue.Empty:
                 continue
             if self._stop_audio.is_set():
                 break
-            with self._audio_lock:
-                generation = self._mute_gen
             self._transcribing = True
             self._on_ui(self._sync_status)
+            failed = False
             try:
                 text = "" if self.transcriber is None else self.transcriber.transcribe(utterance)
+            except Exception as exc:
+                failed = True
+                self._on_ui(self.log_line, str(exc))
             finally:
                 self._transcribing = False
                 self._on_ui(self._sync_status)
-            with self._audio_lock:
-                stale = generation != self._mute_gen
-            if self._stop_audio.is_set() or stale or is_noise(text):
+            if failed or self._stop_audio.is_set() or is_noise(text):
                 continue
-            self._on_ui(self.on_transcript, text)
+            self._on_ui(self._deliver_transcript, text, generation)
+
+    def _load_transcriber(self) -> None:
+        self._loading = True
+        self._on_ui(self._sync_status)
+        logged: str | None = None
+        try:
+            if self.transcriber is None:
+                return
+            while not self._stop_audio.is_set():
+                try:
+                    self.transcriber.load()
+                except Exception as exc:
+                    text = str(exc)
+                    if text != logged:
+                        logged = text
+                        self._on_ui(self.log_line, text)
+                    if not self._wait_for_stop(_LOAD_RETRY_SECONDS):
+                        return
+                    continue
+                return
+        finally:
+            self._loading = False
+            self._on_ui(self._sync_status)
+
+    def _wait_for_stop(self, seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._stop_audio.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            self._stop_audio.wait(min(_AUDIO_WAIT, remaining))
+        return not self._stop_audio.is_set()
+
+    def _deliver_transcript(self, text: str, generation: int) -> None:
+        if generation != self._mute_gen:
+            return
+        self.on_transcript(text)
 
     def _drop_waiting_audio(self) -> None:
         while True:

@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import threading
 import time
 
@@ -8,6 +9,7 @@ from textual.widgets import RichLog, Sparkline
 from hermes_voice.app import VoiceApp
 from hermes_voice.audio import FRAME_BYTES, MIC_SILENT_HINT, MicError, Segmenter
 from hermes_voice.hermes import HermesUnavailable, RunEvent
+from hermes_voice.stt import is_noise
 
 
 class FakeClient:
@@ -346,8 +348,18 @@ def test_utterance_flows_from_mic_to_hermes():
     run(go)
 
 
-def test_noise_transcript_never_reaches_hermes():
+def test_noise_transcript_never_reaches_hermes(monkeypatch):
     # FakeTranscriber returns "Thank you."; asserts c.started == []
+    # calls increments on entry, so wait until is_noise has judged the text.
+    decided: list[str] = []
+
+    def watch(text: str) -> bool:
+        result = is_noise(text)
+        decided.append(text)
+        return result
+
+    monkeypatch.setattr("hermes_voice.app.is_noise", watch)
+
     async def go():
         frames = [_SPEECH] * 20 + [_QUIET] * 34
         mic = FakeMic(frames)
@@ -356,7 +368,7 @@ def test_noise_transcript_never_reaches_hermes():
         app = VoiceApp(c, "voice-test", mic=mic, transcriber=heard, segmenter=_segmenter())
         async with app.run_test() as pilot:
             await pilot.pause()
-            await until(lambda: heard.calls >= 1)
+            await until(lambda: decided == ["Thank you."])
             await pilot.pause()
             assert c.started == []
     run(go)
@@ -495,4 +507,141 @@ def test_closing_the_app_stops_the_mic_and_workers():
         assert mic.stops >= 1
         assert not app._capture_thread.is_alive()
         assert not app._stt_thread.is_alive()
+    run(go)
+
+
+def test_stale_transcript_does_not_reach_hermes():
+    async def go():
+        c = FakeClient()
+        app = VoiceApp(c, "voice-test")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._mute_gen = 1
+            app._deliver_transcript("open the logs", 0)
+            await pilot.pause()
+            assert c.started == []
+    run(go)
+
+
+def test_capture_error_is_logged_once_and_the_loop_keeps_running():
+    class RaisingMic(FakeMic):
+        def read(self, timeout: float = 0.1) -> bytes | None:
+            del timeout
+            self.reads += 1
+            raise RuntimeError("capture blew up")
+
+    async def go():
+        mic = RaisingMic()
+        app = VoiceApp(
+            FakeClient(),
+            "voice-test",
+            mic=mic,
+            transcriber=FakeTranscriber([]),
+            segmenter=_segmenter(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await until(
+                lambda: (
+                    mic.reads >= 3
+                    and _log_text(app).count("capture blew up") == 1
+                    and app.status == "mic lost"
+                )
+                or not app._capture_thread.is_alive()
+            )
+            assert app._capture_thread.is_alive()
+            assert mic.reads >= 3
+            assert _log_text(app).count("capture blew up") == 1
+            assert app.status == "mic lost"
+    run(go)
+
+
+def test_transcribe_error_drops_the_utterance_and_the_loop_continues():
+    class Emit:
+        def __init__(self):
+            self.in_speech = False
+
+        def push(self, frame):
+            del frame
+            self.in_speech = False
+            return _SPEECH
+
+        def reset(self):
+            self.in_speech = False
+
+    class Flaky(FakeTranscriber):
+        def transcribe(self, pcm: bytes) -> str:
+            del pcm
+            self.calls += 1
+            self.entered.set()
+            if self.calls == 1:
+                raise RuntimeError("stt failed")
+            if not self._texts:
+                return ""
+            return self._texts.pop(0)
+
+    async def go():
+        mic = FakeMic([_SPEECH, _SPEECH])
+        heard = Flaky(["open the logs"])
+        c = FakeClient()
+        app = VoiceApp(c, "voice-test", mic=mic, transcriber=heard, segmenter=Emit())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await until(lambda: c.started == ["open the logs"] or not app._stt_thread.is_alive())
+            assert c.started == ["open the logs"]
+            assert "stt failed" in _log_text(app)
+            assert heard.calls == 2
+    run(go)
+
+
+def test_model_load_error_stays_loading_and_retries():
+    class NeverLoads(FakeTranscriber):
+        def __init__(self):
+            super().__init__([])
+            self.loads = 0
+            self.times: list[float] = []
+
+        def load(self) -> None:
+            self.loads += 1
+            self.times.append(time.monotonic())
+            raise RuntimeError("model download failed")
+
+    async def go():
+        heard = NeverLoads()
+        app = VoiceApp(
+            FakeClient(),
+            "voice-test",
+            mic=FakeMic(),
+            transcriber=heard,
+            segmenter=_segmenter(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await until(
+                lambda: heard.loads >= 2 or not app._stt_thread.is_alive(),
+                timeout=8,
+            )
+            assert heard.loads >= 2
+            assert app._stt_thread.is_alive()
+            assert app.status == "loading"
+            assert _log_text(app).count("model download failed") == 1
+            assert heard.times[1] - heard.times[0] >= 5
+            app._stop_audio.set()
+            await asyncio.to_thread(app._stt_thread.join, 1.0)
+            assert not app._stt_thread.is_alive()
+    run(go)
+
+
+def test_cancelled_ui_callback_does_not_raise():
+    async def go():
+        app = VoiceApp(FakeClient(), "voice-test")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            def cancelled(*_args, **_kwargs):
+                raise concurrent.futures.CancelledError()
+
+            app.call_from_thread = cancelled
+            app._on_ui(app.log_line, "still shutting down")
+            assert app.is_running
     run(go)
