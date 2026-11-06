@@ -43,6 +43,40 @@ def test_missing_portaudio_gives_install_hint(monkeypatch):
     with pytest.raises(MicError, match="libportaudio2"):
         Mic().start()
 
+def test_stop_discards_audio_still_in_the_queue(monkeypatch):
+    held = {}
+
+    class Stream:
+        active = True
+
+        def start(self):
+            self.active = True
+
+        def close(self):
+            self.active = False
+
+    def open_stream(**kwargs):
+        held["callback"] = kwargs["callback"]
+        return Stream()
+
+    fake = NS(
+        PortAudioError=type("PortAudioError", (Exception,), {}),
+        RawInputStream=open_stream,
+        _terminate=lambda: None,
+        _initialize=lambda: None,
+        query_devices=lambda device=None, kind=None: {"name": "Fake Mic", "max_input_channels": 1},
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", fake)
+    mic = Mic()
+    mic.start()
+    frame = b"\x01" * FRAME_BYTES
+    held["callback"](frame, 480, None, None)
+    assert mic.read(timeout=0) == frame
+    held["callback"](frame, 480, None, None)
+    mic.stop()
+    assert mic.read(timeout=0) is None
+
+
 def test_device_that_cannot_open_points_to_list_devices(monkeypatch):
     class PortAudioError(Exception):
         pass

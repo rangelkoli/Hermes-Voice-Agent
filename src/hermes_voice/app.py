@@ -1,8 +1,12 @@
 """Terminal UI for a Hermes voice conversation."""
 
 import asyncio
+import queue
+import threading
+import time
 from collections import deque
 
+import httpx
 from rich.markdown import Markdown
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -11,11 +15,16 @@ from textual.containers import Horizontal
 from textual.reactive import reactive
 from textual.widgets import Footer, RichLog, Sparkline, Static
 
+from hermes_voice.audio import MIC_SILENT_HINT, MicError, level
 from hermes_voice.hermes import TERMINAL, HermesAuthError, HermesUnavailable, RunEvent
-from hermes_voice.stt import apply_wake
+from hermes_voice.stt import apply_wake, is_noise
 
 # ponytail: the meter keeps the newest 120 samples. Older levels are dropped.
 _METER_KEEP = 120
+# ponytail: a dead mic is reopened after a fixed 2 seconds. Quit and mute return early.
+_MIC_RETRY_SECONDS = 2.0
+_AUDIO_WAIT = 0.1
+_SILENT_FRAMES = 100
 
 
 def _status_class(status: str) -> str:
@@ -120,7 +129,6 @@ class VoiceApp(App[None]):
         self.client = client
         self.session_id = session_id
         self.wake = wake
-        # ponytail: stored for Task 5. No audio workers run in this task.
         self.mic = mic
         self.transcriber = transcriber
         self.segmenter = segmenter
@@ -133,6 +141,22 @@ class VoiceApp(App[None]):
         self._busy = False
         self._stop_sending = False
         self._quit = False
+        self._muted = False
+        self._mic_lost = False
+        self._offline = False
+        self._hearing = False
+        self._transcribing = False
+        self._loading = False
+        self._retry_mic = False
+        self._mute_gen = 0
+        self._zero_frames = 0
+        self._frame_count = 0
+        self._logged_mic_errors: set[str] = set()
+        self._utterances: queue.Queue[bytes] = queue.Queue()
+        self._stop_audio = threading.Event()
+        self._audio_lock = threading.Lock()
+        self._capture_thread: threading.Thread | None = None
+        self._stt_thread: threading.Thread | None = None
 
     def compose(self) -> ComposeResult:
         device = "" if self.mic is None else str(self.mic.name)
@@ -151,6 +175,191 @@ class VoiceApp(App[None]):
         widget = self.query_one("#status", Static)
         widget.set_classes(_status_class(status))
         widget.update(f"● {status.upper()}")
+
+    def on_mount(self) -> None:
+        if self.mic is None:
+            return
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, name="hermes-capture", daemon=True
+        )
+        self._stt_thread = threading.Thread(
+            target=self._stt_loop, name="hermes-stt", daemon=True
+        )
+        self._capture_thread.start()
+        self._stt_thread.start()
+
+    def on_unmount(self) -> None:
+        self._quit = True
+        self._stop_audio.set()
+        if self.mic is not None:
+            self.mic.stop()
+
+    def _sync_status(self) -> None:
+        if self._mic_lost:
+            status = "mic lost"
+        elif self._muted:
+            status = "muted"
+        elif self._approval is not None:
+            status = "approval"
+        elif self._offline:
+            status = "offline"
+        elif self._run_id is not None:
+            status = "thinking"
+        elif self._loading:
+            status = "loading"
+        elif self._transcribing:
+            status = "transcribing"
+        elif self._hearing:
+            status = "hearing"
+        else:
+            status = "listening"
+        self.status = status
+
+    def _on_ui(self, callback, *args, **kwargs) -> None:
+        # ponytail: call_from_thread raises if the loop is already gone. Drop that race.
+        if self._quit or not self.is_running:
+            return
+        try:
+            self.call_from_thread(callback, *args, **kwargs)
+        except RuntimeError:
+            return
+        except Exception:
+            if self._quit or not self.is_running:
+                return
+            raise
+
+    def _repaint(self) -> None:
+        self.refresh(repaint=True)
+
+    def _capture_loop(self) -> None:
+        try:
+            while not self._stop_audio.is_set():
+                if self._muted:
+                    self._stop_audio.wait(_AUDIO_WAIT)
+                    continue
+                if not self.mic.alive:
+                    self._recover_mic()
+                    continue
+                frame = self.mic.read(_AUDIO_WAIT)
+                if frame is None or self._muted or self._stop_audio.is_set():
+                    continue
+                self._take_frame(frame)
+        finally:
+            self.mic.stop()
+
+    def _recover_mic(self) -> None:
+        if self._muted or self._stop_audio.is_set():
+            return
+        if self._retry_mic:
+            self._mic_lost = True
+            self._on_ui(self._sync_status)
+            if not self._wait_to_retry():
+                return
+        outcome, message = self._try_start()
+        if outcome == "started":
+            self._mic_lost = False
+            self._on_ui(self._sync_status)
+            self._on_ui(self._repaint)
+        elif outcome == "alive":
+            if self._mic_lost:
+                self._mic_lost = False
+                self._on_ui(self._sync_status)
+        elif outcome == "lost":
+            self._mic_lost = True
+            self._on_ui(self._sync_status)
+            if message:
+                self._on_ui(self.log_line, message)
+
+    def _wait_to_retry(self) -> bool:
+        deadline = time.monotonic() + _MIC_RETRY_SECONDS
+        while time.monotonic() < deadline:
+            if self._stop_audio.is_set() or self._muted:
+                return False
+            if self.mic.alive:
+                self._mic_lost = False
+                self._on_ui(self._sync_status)
+                return False
+            self._stop_audio.wait(_AUDIO_WAIT)
+        return not self._stop_audio.is_set() and not self._muted
+
+    def _try_start(self) -> tuple[str, str | None]:
+        message = None
+        with self._audio_lock:
+            if self._muted or self._stop_audio.is_set():
+                return "skip", None
+            if self.mic.alive:
+                return "alive", None
+            try:
+                self.mic.start()
+            except MicError as exc:
+                text = str(exc)
+                if text not in self._logged_mic_errors:
+                    self._logged_mic_errors.add(text)
+                    message = text
+                self._retry_mic = True
+                return "lost", message
+            self._retry_mic = True
+        return "started", None
+
+    def _take_frame(self, frame: bytes) -> None:
+        self._frame_count += 1
+        if self._frame_count % 3 == 0:
+            self._on_ui(self.set_level, level(frame))
+        if not any(frame):
+            self._zero_frames += 1
+            if self._zero_frames == _SILENT_FRAMES:
+                self._on_ui(self.log_line, MIC_SILENT_HINT)
+        else:
+            self._zero_frames = 0
+        with self._audio_lock:
+            if self._muted or self.segmenter is None:
+                return
+            utterance = self.segmenter.push(frame)
+            hearing = bool(self.segmenter.in_speech)
+            changed = hearing != self._hearing
+            self._hearing = hearing
+            if utterance is not None:
+                self._utterances.put(utterance)
+        if changed:
+            self._on_ui(self._sync_status)
+
+    def _stt_loop(self) -> None:
+        self._loading = True
+        self._on_ui(self._sync_status)
+        try:
+            if self.transcriber is not None:
+                self.transcriber.load()
+        finally:
+            self._loading = False
+            self._on_ui(self._sync_status)
+        while not self._stop_audio.is_set():
+            try:
+                utterance = self._utterances.get(timeout=_AUDIO_WAIT)
+            except queue.Empty:
+                continue
+            if self._stop_audio.is_set():
+                break
+            with self._audio_lock:
+                generation = self._mute_gen
+            self._transcribing = True
+            self._on_ui(self._sync_status)
+            try:
+                text = "" if self.transcriber is None else self.transcriber.transcribe(utterance)
+            finally:
+                self._transcribing = False
+                self._on_ui(self._sync_status)
+            with self._audio_lock:
+                stale = generation != self._mute_gen
+            if self._stop_audio.is_set() or stale or is_noise(text):
+                continue
+            self._on_ui(self.on_transcript, text)
+
+    def _drop_waiting_audio(self) -> None:
+        while True:
+            try:
+                self._utterances.get_nowait()
+            except queue.Empty:
+                return
 
     def on_transcript(self, text: str) -> None:
         spoken = apply_wake(text, self.wake)
@@ -188,27 +397,28 @@ class VoiceApp(App[None]):
                 try:
                     run_id = await self.client.start_run(text, self.session_id)
                 except HermesUnavailable:
-                    self.status = "offline"
+                    self._offline = True
+                    self._sync_status()
                     self.set_timer(self._retry_seconds, self._ensure_send)
                     return
                 except HermesAuthError:
                     self._stop_sending = True
                     self.log_line("Hermes rejected the API key. Check API_SERVER_KEY.")
                     return
+                self._offline = False
                 del self._pending[: len(batch)]
                 self._run_id = run_id
                 self._approval = None
                 self._reply = ""
                 self.query_one("#stream", Static).update("")
-                self.status = "thinking"
+                self._sync_status()
                 try:
                     async for event in self.client.events(run_id):
                         self._on_event(event)
                 finally:
                     self._run_id = None
                     self._approval = None
-                    if self.status in ("thinking", "approval"):
-                        self.status = "listening"
+                    self._sync_status()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -227,7 +437,6 @@ class VoiceApp(App[None]):
         elif name == "approval.request":
             self._approval = data
             self.log_line(f"Approval  {data.get('command', '')}")
-            self.status = "approval"
             self.bell()
         elif name == "run.completed":
             output = data.get("output", "")
@@ -242,10 +451,9 @@ class VoiceApp(App[None]):
 
         if name in ("approval.responded", "tool.completed") or name in TERMINAL:
             self._approval = None
-            if name not in TERMINAL and self.status == "approval" and self._run_id is not None:
-                self.status = "thinking"
         if name in TERMINAL:
-            self.status = "listening"
+            self._run_id = None
+        self._sync_status()
 
     def _write_tool(self, data: dict) -> None:
         parts = [str(data.get("tool", ""))]
@@ -264,7 +472,37 @@ class VoiceApp(App[None]):
         self.query_one("#stream", Static).update("")
 
     def action_mute(self) -> None:
-        pass
+        if self.mic is None:
+            return
+        message = None
+        started = False
+        with self._audio_lock:
+            self._muted = not self._muted
+            if self._muted:
+                self._mute_gen += 1
+                self.mic.stop()
+                if self.segmenter is not None:
+                    self.segmenter.reset()
+                self._hearing = False
+                self._drop_waiting_audio()
+            else:
+                try:
+                    self.mic.start()
+                except MicError as exc:
+                    self._mic_lost = True
+                    text = str(exc)
+                    if text not in self._logged_mic_errors:
+                        self._logged_mic_errors.add(text)
+                        message = text
+                else:
+                    self._mic_lost = False
+                    self._retry_mic = True
+                    started = True
+        if message:
+            self.log_line(message)
+        if started:
+            self.refresh(repaint=True)
+        self._sync_status()
 
     async def action_stop(self) -> None:
         run_id = self._run_id
@@ -274,6 +512,10 @@ class VoiceApp(App[None]):
             await self.client.stop(run_id)
         except HermesUnavailable:
             self.log_line("Could not stop the run. Hermes is unavailable.")
+        except httpx.HTTPStatusError:
+            self.log_line("Could not stop the run. It had already finished.")
+        except HermesAuthError:
+            self.log_line("Could not stop the run. Hermes rejected the API key.")
 
     async def action_approve(self) -> None:
         await self._choose("once")
@@ -289,12 +531,25 @@ class VoiceApp(App[None]):
             await self.client.approve(self._run_id, choice, request_id)
         except HermesUnavailable:
             self.log_line("Could not send the approval. Hermes is unavailable.")
+        except httpx.HTTPStatusError:
+            self.log_line("Could not send the approval. It had already finished.")
+        except HermesAuthError:
+            self.log_line("Could not send the approval. Hermes rejected the API key.")
 
     async def action_quit(self) -> None:
         self._quit = True
+        self._stop_audio.set()
+        if self.mic is not None:
+            self.mic.stop()
+        await self._join_audio()
         try:
             await self.client.aclose()
         except Exception as exc:
             self.log_line(f"Could not close Hermes: {exc}")
         finally:
             self.exit()
+
+    async def _join_audio(self) -> None:
+        for thread in (self._capture_thread, self._stt_thread):
+            if thread is not None:
+                await asyncio.to_thread(thread.join, 1.0)

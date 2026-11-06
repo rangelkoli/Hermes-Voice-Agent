@@ -3,6 +3,7 @@
 import array
 import queue
 import sys
+import threading
 from collections import deque
 from collections.abc import Callable
 
@@ -154,6 +155,7 @@ class Mic:
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=1000)
         self._stream = None
         self._name: str | None = None
+        self._lock = threading.Lock()
 
     def check(self) -> None:
         sd = _sounddevice()
@@ -178,21 +180,30 @@ class Mic:
                 callback=self._on_audio,
             )
             stream.start()
-            self._stream = stream
-            self._name = sd.query_devices(self._device, kind="input")["name"]
+            with self._lock:
+                self._stream = stream
+                self._name = sd.query_devices(self._device, kind="input")["name"]
         except (sd.PortAudioError, ValueError) as exc:
-            if stream is not None:
+            with self._lock:
+                published = self._stream is stream
+            if stream is not None and not published:
                 stream.close()
-            self._stream = None
+            self.stop()
             raise MicError(
                 f"Could not open the microphone: {exc}. Run with --list-devices."
             ) from exc
 
     def stop(self) -> None:
-        stream = self._stream
-        self._stream = None
+        with self._lock:
+            stream = self._stream
+            self._stream = None
         if stream is not None:
             stream.close()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
 
     def read(self, timeout: float = 0.1) -> bytes | None:
         try:
@@ -202,7 +213,8 @@ class Mic:
 
     @property
     def alive(self) -> bool:
-        stream = self._stream
+        with self._lock:
+            stream = self._stream
         return stream is not None and bool(stream.active)
 
     @property
