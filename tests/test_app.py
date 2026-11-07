@@ -1935,6 +1935,8 @@ def test_matching_utterance_is_not_uploaded_if_listening_stopped_during_the_chec
             with app._audio_lock:
                 setattr(app, flag, True)
                 app._close_gate()
+            with app._audio_lock:
+                setattr(app, flag, False)  # a glitch that recovers before the check ends
             wake.release.set()
             await asyncio.sleep(0.3)
             await pilot.pause()

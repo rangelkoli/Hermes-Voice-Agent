@@ -269,9 +269,10 @@ class VoiceApp(App[None]):
         self.status = status
 
     def _close_gate(self) -> None:
-        """Caller holds _audio_lock. Drop the wake, partial speech, and queued audio."""
+        """Caller holds _audio_lock. Drop the wake, partial speech, and all audio in flight."""
         if self.gate is None:
             return
+        self._mute_gen += 1
         self.gate.sleep()
         if self.segmenter is not None:
             self.segmenter.reset()
@@ -505,8 +506,6 @@ class VoiceApp(App[None]):
             return False
         with self._audio_lock:
             if generation != self._mute_gen or self.gate is None or self.gate.awake:
-                return False
-            if self._speaking or self._mic_lost:
                 return False
             remainder = wake_match(heard, self.wake or "")
             if remainder is None:
@@ -856,9 +855,7 @@ class VoiceApp(App[None]):
                 if self.segmenter is not None:
                     self.segmenter.reset()
                 self._hearing = False
-                if self.gate is not None:
-                    self.gate.sleep()
-                    self._drop_waiting_audio()
+                self._close_gate()
                 if self._stop_audio.is_set() or self._stop_speech.is_set():
                     self._speaking = False
                     return False
