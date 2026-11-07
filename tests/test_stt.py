@@ -54,3 +54,7 @@ def test_join_skips_likely_non_speech_segments():
 def test_soundalikes_are_only_for_hermes():
     assert wake_match("Hey almies", "hey jarvis") is None
 
+
+def test_soundalikes_work_with_a_capitalized_phrase():
+    assert wake_match("Hey almies", "Hey Hermes") == ""
+

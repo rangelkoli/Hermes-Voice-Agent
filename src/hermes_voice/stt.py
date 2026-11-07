@@ -51,8 +51,8 @@ def wake_match(text: str, phrase: str) -> str | None:
     # ponytail: the key word has to be one of the first four words, and a
     # sentence break is only . ! or ?. A Hermes later in the sentence is ignored.
     pattern = rf"(?:^|[.!?]\s+)(?:[\w'’]+[\s,]+){{0,3}}?{word}\b\W*"
-    if words[-1] in _SOUNDS_LIKE:
-        soundalike = _SOUNDS_LIKE[words[-1]]
+    soundalike = _SOUNDS_LIKE.get(words[-1].lower())
+    if soundalike:
         pattern += rf"|(?:^|[.!?]\s+){_GREETING}\W+{soundalike}\b\W*"
     matches = list(re.finditer(pattern, folded, flags=re.IGNORECASE))
     if not matches:
