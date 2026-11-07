@@ -149,6 +149,7 @@ class VoiceApp(App[None]):
         speaker=None,
         gate=None,
         wake_transcriber=None,
+        show_heard: bool = False,
     ) -> None:
         super().__init__()
         self.client = client
@@ -157,6 +158,7 @@ class VoiceApp(App[None]):
         self.mic = mic
         self.transcriber = transcriber
         self.wake_transcriber = wake_transcriber
+        self.show_heard = show_heard
         self.segmenter = segmenter
         self.speaker = speaker
         self.gate = gate
@@ -491,6 +493,8 @@ class VoiceApp(App[None]):
         try:
             if self.wake_transcriber is not None:
                 heard = self.wake_transcriber.transcribe(utterance)
+                if self.show_heard:
+                    self._on_ui(self.log_line, f"heard: {heard}")
         except Exception as exc:
             failed = True
             self._on_ui(self.log_line, str(exc))

@@ -382,3 +382,12 @@ def test_open_mic_builds_no_gate_and_no_wake_model(monkeypatch, capsys, tmp_path
     assert app.wake is None
     assert app.wake_transcriber is None
     assert "Preparing the wake word model..." not in capsys.readouterr().out
+
+
+def test_show_heard_reaches_the_app(monkeypatch, tmp_path):
+    _ready(monkeypatch, tmp_path)
+    found, _thresholds = _capture_app(monkeypatch, tmp_path)
+
+    main(["--show-heard"])
+
+    assert found["app"].show_heard is True

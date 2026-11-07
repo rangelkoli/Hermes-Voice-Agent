@@ -16,7 +16,7 @@ Create a Gemini API key at [aistudio.google.com/apikey](https://aistudio.google.
 uv run hermes-voice
 ```
 
-The wake phrase is required. Say "hey hermes", then the command. Change the phrase with `--wake "computer"`. `--open-mic` sends every utterance and does not use a wake phrase. `--wake-model` chooses the on-device model that listens for the phrase. The default is `base.en`. `--vad-threshold` is how sure speech detection must be. The default is `0.5`.
+The wake phrase is required. Say "hey hermes", then the command. Change the phrase with `--wake "computer"`. `--open-mic` sends every utterance and does not use a wake phrase. `--wake-model` chooses the on-device model that listens for the phrase. The default is `base.en`. `--show-heard` prints what that model hears while waiting, on screen only, which helps when the phrase is not waking it. `--vad-threshold` is how sure speech detection must be. The default is `0.5`.
 
 The Hermes key is read from `HERMES_API_KEY`. If that is unset, it is read from `API_SERVER_KEY` in `$HERMES_HOME/.env`, or `~/.hermes/.env` when `HERMES_HOME` is unset.
 

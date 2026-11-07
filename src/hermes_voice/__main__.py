@@ -67,6 +67,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--wake", default="hey hermes")
     parser.add_argument("--open-mic", action="store_true")
     parser.add_argument("--wake-model", default="base.en")
+    parser.add_argument("--show-heard", action="store_true")
     parser.add_argument("--device", type=_device)
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--local", action="store_true")
@@ -131,6 +132,7 @@ def main(argv: list[str] | None = None) -> None:
         mic=Mic(args.device),
         transcriber=transcriber,
         wake_transcriber=wake_transcriber,
+        show_heard=args.show_heard,
         segmenter=Segmenter(
             SpeechDetector(args.vad_threshold), end_silence_ms=args.end_silence_ms
         ),

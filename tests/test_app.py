@@ -1859,3 +1859,52 @@ def test_wake_model_failure_logs_and_sends_nothing():
             await asyncio.to_thread(app._stt_thread.join, 1.0)
             assert not app._stt_thread.is_alive()
     run(go)
+
+
+def test_show_heard_prints_what_the_wake_model_heard():
+    async def go():
+        mic = FakeMic([_SPEECH] * 20 + [_QUIET] * 34)
+        wake = FakeTranscriber(["hey her mess"])
+        cloud = FakeTranscriber([])
+        app = VoiceApp(
+            FakeClient(),
+            "voice-test",
+            wake="hey hermes",
+            gate=WakeGate(),
+            mic=mic,
+            transcriber=cloud,
+            wake_transcriber=wake,
+            segmenter=_segmenter(),
+            show_heard=True,
+        )
+        async with app.run_test() as pilot:
+            await until(lambda: wake.calls >= 1)
+            await asyncio.sleep(0.2)
+            await pilot.pause()
+            assert "heard: hey her mess" in _log_text(app)
+            assert cloud.calls == 0
+
+    run(go)
+
+
+def test_heard_text_stays_hidden_by_default():
+    async def go():
+        mic = FakeMic([_SPEECH] * 20 + [_QUIET] * 34)
+        wake = FakeTranscriber(["private room talk"])
+        app = VoiceApp(
+            FakeClient(),
+            "voice-test",
+            wake="hey hermes",
+            gate=WakeGate(),
+            mic=mic,
+            transcriber=FakeTranscriber([]),
+            wake_transcriber=wake,
+            segmenter=_segmenter(),
+        )
+        async with app.run_test() as pilot:
+            await until(lambda: wake.calls >= 1)
+            await asyncio.sleep(0.2)
+            await pilot.pause()
+            assert "private room talk" not in _log_text(app)
+
+    run(go)

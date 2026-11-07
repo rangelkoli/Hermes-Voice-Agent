@@ -18,6 +18,7 @@ def test_real_requests_are_kept(text):
     ("Hermes open the logs", "open the logs"),
     ("Pay Hermes, what time is it?", "what time is it?"),
     ("Have a Hermes", ""),
+    ("and the new Hermes, what time is it?", "what time is it?"),
     ("Hey Hermès", ""),
     ("Thanks. Hey Hermes, go", "go"),
     ("hey hermes stop. hey hermes go", "go"),

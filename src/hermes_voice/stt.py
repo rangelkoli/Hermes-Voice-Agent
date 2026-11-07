@@ -43,9 +43,9 @@ def wake_match(text: str, phrase: str) -> str | None:
         return None
     folded = _fold(text)
     word = re.escape(words[-1])
-    # ponytail: the key word has to be one of the first three words, and a
+    # ponytail: the key word has to be one of the first four words, and a
     # sentence break is only . ! or ?. A Hermes later in the sentence is ignored.
-    pattern = rf"(?:^|[.!?]\s+)(?:[\w'’]+[\s,]+){{0,2}}?{word}\b\W*"
+    pattern = rf"(?:^|[.!?]\s+)(?:[\w'’]+[\s,]+){{0,3}}?{word}\b\W*"
     matches = list(re.finditer(pattern, folded, flags=re.IGNORECASE))
     if not matches:
         return None
