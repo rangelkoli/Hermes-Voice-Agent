@@ -22,6 +22,15 @@ def test_real_requests_are_kept(text):
     ("Hey Hermès", ""),
     ("Thanks. Hey Hermes, go", "go"),
     ("hey hermes stop. hey hermes go", "go"),
+    ("Hey, almies!", ""),
+    ("Hey almies, what time is it?", "what time is it?"),
+    ("Hey her mess", ""),
+    ("hey hermies open the logs", "open the logs"),
+    ("Hi armies.", ""),
+    ("Hey her message came through", None),
+    ("Hey James, are you coming?", None),
+    ("Hey Amy's here", None),
+    ("Almies are great", None),
     ("Hey Herman, can you open the door?", None),
     ("We should talk about the budget", None),
     ("We bought a very expensive Hermes scarf", None),
@@ -40,3 +49,8 @@ def test_prompt_word_alone_is_noise():
 def test_join_skips_likely_non_speech_segments():
     segs = [NS(text=" open logs", no_speech_prob=0.1), NS(text=" Thank you", no_speech_prob=0.9)]
     assert join_segments(segs) == "open logs"
+
+
+def test_soundalikes_are_only_for_hermes():
+    assert wake_match("Hey almies", "hey jarvis") is None
+

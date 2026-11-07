@@ -28,7 +28,7 @@ The Hermes key is read from `HERMES_API_KEY`. If that is unset, it is read from 
 
 - `--wake` sets the wake phrase. Default `hey hermes`.
 - `--open-mic` sends every utterance and skips the wake model.
-- `--wake-model` chooses the on-device wake model. Default `base.en`.
+- `--wake-model` chooses the on-device wake model. Default `base.en`. `small.en` hears unclear speech better but takes about 2 seconds per utterance instead of 0.5.
 - `--show-heard` prints what the wake model hears while waiting, on screen only.
 - `--device` picks an input by index or name.
 - `--list-devices` prints input devices and exits.

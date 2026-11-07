@@ -13,6 +13,11 @@ _NOISE = frozenset({
     "hermes",
 })
 
+# ponytail: how Whisper mishears Hermes, such as "almies" and "her mess". Only trusted right
+# after a greeting, and only for this word. Add spellings here as --show-heard reveals them.
+_SOUNDS_LIKE = {"hermes": r"h?[aeiou]{1,2}[lr]\s?m(?:e|ee|ea|ie|i|y)[sz]+"}
+_GREETING = r"(?:hey|hay|hi|heh)"
+
 _PUNCTUATION = str.maketrans("", "", string.punctuation)
 _BRACKETS = {("[", "]"), ("(", ")")}
 
@@ -46,6 +51,9 @@ def wake_match(text: str, phrase: str) -> str | None:
     # ponytail: the key word has to be one of the first four words, and a
     # sentence break is only . ! or ?. A Hermes later in the sentence is ignored.
     pattern = rf"(?:^|[.!?]\s+)(?:[\w'’]+[\s,]+){{0,3}}?{word}\b\W*"
+    if words[-1] in _SOUNDS_LIKE:
+        soundalike = _SOUNDS_LIKE[words[-1]]
+        pattern += rf"|(?:^|[.!?]\s+){_GREETING}\W+{soundalike}\b\W*"
     matches = list(re.finditer(pattern, folded, flags=re.IGNORECASE))
     if not matches:
         return None
