@@ -305,7 +305,8 @@ def test_detector_reset_clears_state():
     frames = _frames(_FIXTURE.read_bytes())
     assert any(detector(frame) for frame in frames)
     detector.reset()
-    assert detector(frames[0]) is False
+    fresh = SpeechDetector()
+    assert [detector(frame) for frame in frames] == [fresh(frame) for frame in frames]
 
 
 def test_utterance_ends_in_a_noisy_room():

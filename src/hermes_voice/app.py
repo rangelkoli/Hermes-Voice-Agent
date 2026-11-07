@@ -464,6 +464,9 @@ class VoiceApp(App[None]):
             with self._audio_lock:
                 if generation != self._mute_gen:
                     continue
+                # The gate can close during the local check, after this utterance left the queue.
+                if self.gate is not None and not self.gate.awake:
+                    continue
                 self._transcribing = True
             self._on_ui(self._sync_status)
             failed = False
@@ -502,6 +505,8 @@ class VoiceApp(App[None]):
             return False
         with self._audio_lock:
             if generation != self._mute_gen or self.gate is None or self.gate.awake:
+                return False
+            if self._speaking or self._mic_lost:
                 return False
             remainder = wake_match(heard, self.wake or "")
             if remainder is None:

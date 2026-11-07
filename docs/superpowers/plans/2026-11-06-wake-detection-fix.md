@@ -17,7 +17,7 @@
 
 - The promise is now: no audio or text leaves this computer until the phrase is heard. Audio does reach the segmenter and local Whisper while asleep.
 - Wake model: `base.en`, chosen over `tiny.en`, which missed more phrases.
-- The wake word is the last word of the phrase. It must appear within the first three words of a sentence, so Whisper's "Pay Hermes" and "Have a Hermes" still count, and "Hermes open the logs" works too.
+- The wake word is the last word of the phrase. It must appear within the first four words of a sentence, so Whisper's "Pay Hermes" and "Have a Hermes" still count, and "Hermes open the logs" works too.
 - A matched utterance goes to the cloud as a whole, so the command keeps its first words. No ring buffer is needed.
 
 ## Global Constraints
@@ -145,7 +145,7 @@ Remove tests for deleted code. Run: `uv run pytest -q`. Expected: new tests FAIL
 
 - [ ] **Step 3: Implement detection and matching**
 
-`wake_match`: strip accents with `unicodedata` NFKD before matching. Key word is the phrase's last word. Pattern: `(?:^|[.!?]\s+)(?:[\w'’]+[\s,]+){0,2}?<word>\b\W*`, case-insensitive. Use the last match, and return the rest of the text, stripped of leading punctuation and spaces.
+`wake_match`: strip accents with `unicodedata` NFKD before matching. Key word is the phrase's last word. Pattern: `(?:^|[.!?]\s+)(?:[\w'’]+[\s,]+){0,3}?<word>\b\W*`, case-insensitive. Use the last match, and return the rest of the text, stripped of leading punctuation and spaces.
 
 - [ ] **Step 4: Rewire `VoiceApp`**
 

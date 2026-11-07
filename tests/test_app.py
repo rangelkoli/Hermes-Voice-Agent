@@ -1908,3 +1908,61 @@ def test_heard_text_stays_hidden_by_default():
             assert "private room talk" not in _log_text(app)
 
     run(go)
+
+
+def _wake_check_app(wake, cloud, client):
+    return VoiceApp(
+        client,
+        "voice-test",
+        wake="hey hermes",
+        gate=WakeGate(),
+        mic=FakeMic([_SPEECH] * 20 + [_QUIET] * 34),
+        transcriber=cloud,
+        wake_transcriber=wake,
+        segmenter=_segmenter(),
+    )
+
+
+@pytest.mark.parametrize("flag", ["_mic_lost", "_speaking"])
+def test_matching_utterance_is_not_uploaded_if_listening_stopped_during_the_check(flag):
+    async def go():
+        wake = FakeTranscriber(["hey hermes open the logs"], hold=True)
+        cloud = FakeTranscriber(["open the logs"])
+        c = FakeClient()
+        app = _wake_check_app(wake, cloud, c)
+        async with app.run_test() as pilot:
+            await until(wake.entered.is_set)
+            with app._audio_lock:
+                setattr(app, flag, True)
+                app._close_gate()
+            wake.release.set()
+            await asyncio.sleep(0.3)
+            await pilot.pause()
+            assert cloud.calls == 0
+            assert c.started == []
+            assert app.gate.awake is False
+
+    run(go)
+
+
+def test_gate_closing_after_a_match_stops_the_upload():
+    async def go():
+        wake = FakeTranscriber(["hey hermes open the logs"])
+        cloud = FakeTranscriber(["open the logs"])
+        c = FakeClient()
+        app = _wake_check_app(wake, cloud, c)
+
+        def closes_the_gate():
+            with app._audio_lock:
+                app.gate.sleep()
+
+        app.bell = closes_the_gate
+        async with app.run_test() as pilot:
+            await until(lambda: wake.calls >= 1)
+            await asyncio.sleep(0.3)
+            await pilot.pause()
+            assert cloud.calls == 0
+            assert c.started == []
+
+    run(go)
+
