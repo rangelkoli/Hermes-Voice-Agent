@@ -15,8 +15,14 @@ impl WakeGate {
     }
 
     pub fn wake(&mut self) {
+        self.open_for(self.window);
+    }
+
+    /// Open without the wake phrase, as after a spoken reply. Closes after `window` unless
+    /// speech starts first.
+    pub fn open_for(&mut self, window: Duration) {
         self.awake = true;
-        self.deadline = Some(Instant::now() + self.window);
+        self.deadline = Some(Instant::now() + window);
     }
 
     pub fn touch(&mut self) {
@@ -54,5 +60,17 @@ mod tests {
         assert!(gate.awake);
         assert!(gate.expire(false));
         assert!(!gate.awake);
+    }
+
+    #[test]
+    fn follow_up_window_is_its_own_length() {
+        let mut gate = WakeGate::new(Duration::from_secs(60));
+        gate.open_for(Duration::ZERO);
+        assert!(gate.awake);
+        assert!(!gate.expire(true));
+        assert!(gate.expire(false));
+        gate.open_for(Duration::from_secs(60));
+        assert!(!gate.expire(false));
+        assert!(gate.awake);
     }
 }

@@ -17,7 +17,7 @@ cargo build --release
 target/release/hermes-voice
 ```
 
-The wake phrase is required. Say "hey hermes", then the command. Change the phrase with `--wake "computer"`. `--open-mic` sends every utterance and does not use a wake phrase. `--wake-model` chooses the on-device model that listens for the phrase. The default is `base.en`. `--show-heard` prints what that model hears while waiting, on screen only, which helps when the phrase is not waking it. `--vad-threshold` is how sure speech detection must be. The default is `0.5`.
+The wake phrase is required. Say "hey hermes", then the command. After Hermes finishes speaking, it listens for 2 seconds without the wake phrase, so a follow-up can be said straight away. If no speech starts in that time, it goes back to waiting for the phrase. Change the phrase with `--wake "computer"`. `--open-mic` sends every utterance and does not use a wake phrase. `--wake-model` chooses the on-device model that listens for the phrase. The default is `base.en`. `--show-heard` prints what that model hears while waiting, on screen only, which helps when the phrase is not waking it. `--vad-threshold` is how sure speech detection must be. The default is `0.5`.
 
 The Hermes key is read from `HERMES_API_KEY`. If that is unset, it is read from `API_SERVER_KEY` in `$HERMES_HOME/.env`, or `~/.hermes/.env` when `HERMES_HOME` is unset.
 
@@ -42,7 +42,7 @@ The Hermes key is read from `HERMES_API_KEY`. If that is unset, it is read from 
 
 ## Privacy
 
-> By default nothing leaves this computer until the wake phrase is heard. While waiting, a small Whisper model on this computer listens for the phrase. The utterance containing the phrase, and the next one if you pause, is then sent to Google for transcription. Reply text is sent to Google to be spoken. Transcripts also go to Hermes and its model provider. With `--open-mic`, every utterance is sent. With `--local`, nothing goes to Google.
+> By default nothing leaves this computer until the wake phrase is heard. While waiting, a small Whisper model on this computer listens for the phrase. The utterance containing the phrase, and the next one if you pause, is then sent to Google for transcription. So is speech that starts within 2 seconds of a spoken reply ending. Reply text is sent to Google to be spoken. Transcripts also go to Hermes and its model provider. With `--open-mic`, every utterance is sent. With `--local`, nothing goes to Google.
 
 ## Notes
 
