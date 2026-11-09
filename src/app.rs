@@ -72,6 +72,7 @@ struct Shared {
     bell: bool,
     zero_frames: u32,
     frame_count: u64,
+    weather: Option<(String, String)>,
 }
 
 impl Shared {
@@ -744,6 +745,7 @@ fn draw(frame: &mut Frame, s: &Shared, orb: &Orb, wake: Option<&str>, device: &s
 
     let orb_area = take((rows * 35 / 100).clamp(7, 15));
     orb.render(orb_area, frame.buffer_mut(), BACKGROUND);
+    draw_sides(frame, orb_area, s.weather.as_ref());
 
     let status = s.status();
     let label = if status == "waiting" {
@@ -783,6 +785,72 @@ fn draw(frame: &mut Frame, s: &Shared, orb: &Orb, wake: Option<&str>, device: &s
     }
     let footer_area = Rect::new(area.x, area.y + rows.saturating_sub(1), area.width, rows.min(1));
     frame.render_widget(Paragraph::new(Line::from(footer)).style(Style::default().bg(Color::Rgb(0x24, 0x24, 0x24))), footer_area);
+}
+
+/// Clock to the left of the orb, weather to the right, each centred in its free column.
+fn draw_sides(frame: &mut Frame, orb_area: Rect, weather: Option<&(String, String)>) {
+    let side = orb_area.width.saturating_sub(orb_area.height * 2) / 2;
+    if side < 10 || orb_area.height < 2 {
+        return;
+    }
+    let dim = Style::default().fg(Color::Rgb(0x90, 0x90, 0x90));
+    let bright = Style::default().fg(Color::Rgb(0xe0, 0xe0, 0xe0)).add_modifier(Modifier::BOLD);
+    let mid = orb_area.y + orb_area.height / 2 - 1;
+    let left = Rect::new(orb_area.x, mid, side, 2);
+    let right = Rect::new(orb_area.right() - side, mid, side, 2);
+    let now = local_now();
+    let time = vec![Line::styled(clock(now.tm_hour, now.tm_min), bright), Line::styled(weekday(now.tm_wday), dim)];
+    frame.render_widget(Paragraph::new(time).centered(), left);
+    if let Some((temp, sky)) = weather {
+        let lines = vec![Line::styled(temp.clone(), bright), Line::styled(sky.clone(), dim)];
+        frame.render_widget(Paragraph::new(lines).centered(), right);
+    }
+}
+
+pub fn local_now() -> libc::tm {
+    // SAFETY: localtime_r only writes the struct we pass.
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        tm
+    }
+}
+
+fn clock(hour: i32, min: i32) -> String {
+    let h = if hour % 12 == 0 { 12 } else { hour % 12 };
+    format!("{h}:{min:02} {}", if hour < 12 { "AM" } else { "PM" })
+}
+
+fn weekday(day: i32) -> &'static str {
+    ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][day.rem_euclid(7) as usize]
+}
+
+/// wttr.in answers `+51°F|Overcast`; anything else is an error page.
+fn parse_weather(body: &str) -> Option<(String, String)> {
+    let (temp, sky) = body.trim().split_once('|')?;
+    if !temp.contains('°') || sky.len() > 40 {
+        return None;
+    }
+    Some((temp.trim_start_matches('+').to_string(), sky.trim().to_string()))
+}
+
+// ponytail: location comes from the caller's IP via wttr.in. Add a --location flag if that guesses wrong.
+fn weather_loop(core: &Core) {
+    while !core.quit.load(Ordering::Relaxed) {
+        let fetched = ureq::get("https://wttr.in/?format=%t|%C")
+            .timeout(Duration::from_secs(10))
+            .call()
+            .ok()
+            .and_then(|r| r.into_string().ok())
+            .and_then(|b| parse_weather(&b));
+        let ok = fetched.is_some();
+        if ok {
+            core.lock().weather = fetched;
+        }
+        // ponytail: refresh every 15 minutes, retry a failure after 1 minute
+        std::thread::sleep(Duration::from_secs(if ok { 900 } else { 60 }));
+    }
 }
 
 fn pad(area: Rect) -> Rect {
@@ -883,6 +951,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
     let (stt, wake_stt) = (config.transcriber, config.wake_transcriber);
     spawn("hermes-stt", Box::new(move |c| stt_loop(c, stt, wake_stt)));
     spawn("hermes-send", Box::new(send_loop));
+    spawn("hermes-weather", Box::new(weather_loop));
     if let Some(speaker) = config.speaker {
         let speaker = Arc::new(speaker);
         spawn("hermes-speak", Box::new(move |c| speak_loop(c, speaker)));
@@ -944,6 +1013,15 @@ mod tests {
         assert_eq!(wrap("one two three", 7), ["one two", "three"]);
         assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
         assert_eq!(wrap("a\n\nb", 10), ["a", "", "b"]);
+    }
+
+    #[test]
+    fn clock_is_twelve_hour_and_weather_rejects_error_pages() {
+        assert_eq!(clock(0, 5), "12:05 AM");
+        assert_eq!(clock(12, 0), "12:00 PM");
+        assert_eq!(clock(23, 59), "11:59 PM");
+        assert_eq!(parse_weather("+51°F|Overcast \n"), Some(("51°F".into(), "Overcast".into())));
+        assert_eq!(parse_weather("location not found: upstream error"), None);
     }
 
     #[test]
