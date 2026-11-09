@@ -34,6 +34,8 @@ const SILENT_FRAMES: u32 = 100;
 const SPEAK_WAIT: Duration = Duration::from_secs(30);
 // ponytail: the mic drops audio for 300 ms after speech so it is not transcribed.
 const SPEAK_TAIL: Duration = Duration::from_millis(300);
+// ponytail: after a spoken reply the mic stays open 2 seconds for a follow-up, no wake phrase.
+const FOLLOW_UP: Duration = Duration::from_secs(2);
 const MAX_LOG: usize = 1000;
 const MAX_WIDTH: u16 = 96;
 const BACKGROUND: [u8; 3] = [30, 30, 30];
@@ -612,6 +614,12 @@ fn speak_loop(core: &Core, speaker: Arc<GeminiSpeaker>) {
         s.reset_segmenter();
         s.speaking = false;
         s.speech_waiting = false;
+        // Speech that starts within the window keeps the gate open until it is transcribed.
+        if !s.muted {
+            if let Some(gate) = &mut s.gate {
+                gate.open_for(FOLLOW_UP);
+            }
+        }
     }
 }
 
