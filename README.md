@@ -2,6 +2,8 @@
 
 Hermes Voice listens on the microphone, transcribes speech, and sends the text to a Hermes agent at `http://127.0.0.1:8642`. The conversation stays in the terminal. Replies are spoken aloud.
 
+![Hermes Voice waiting for the wake phrase, with the clock and weather beside the orb](assets/screenshot.png)
+
 ## Setup
 
 Install [Rust](https://rustup.rs) (1.88 or newer) and CMake. Install Hermes with its API server enabled (`API_SERVER_ENABLED=true`).
