@@ -25,7 +25,7 @@ cargo build --release
 target/release/hermes-voice
 ```
 
-The wake phrase is required. Say "hey john", then the command, in one breath or with a pause. A chime sounds as soon as the phrase is heard. After Hermes finishes speaking, it listens for 2 seconds without the wake phrase, so a follow-up can be said straight away. If no speech starts in that time, it goes back to waiting for the phrase. `--open-mic` sends every utterance and does not use a wake phrase.
+The wake phrase is required. Say "hey john", then the command, in one breath or with a pause. A chime sounds as soon as the phrase is heard. After Hermes finishes speaking, it listens for 2 seconds without the wake phrase, so a follow-up can be said straight away. If no speech starts in that time, it goes back to waiting for the phrase. Saying "hey john" while Hermes is speaking cuts the reply off and listens for a new command, in one breath or after a pause. There is no echo cancelling, so if replies cut themselves off, raise `--wake-threshold`. `--open-mic` sends every utterance and does not use a wake phrase.
 
 When it misses the phrase or wakes by itself, run with `--show-scores`. It prints the wake model's score whenever something sounds partly like the phrase, on screen only. Then set `--wake-threshold` between the scores you see for the phrase and for other talk. The default is `0.5`. `--vad-threshold` is how sure speech detection must be. Its default is also `0.5`.
 
