@@ -1,6 +1,6 @@
 //! Local speech-to-text (whisper.cpp) and filters for Whisper output.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use regex::RegexBuilder;
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
@@ -21,7 +21,7 @@ const GREETING: &str = r"(?:hey|hay|hi|heh)";
 
 /// Other spellings Whisper writes for a wake word. Unlike soundalikes, these are the same word,
 /// so they count anywhere the word itself does.
-// ponytail: add a word here as --show-heard reveals its spellings.
+// ponytail: add a word here when transcripts show other spellings of it.
 fn spellings(word: &str) -> Option<&'static str> {
     match word.to_lowercase().as_str() {
         "john" => Some("joh?n"),
@@ -104,17 +104,22 @@ fn model_path(model: &str) -> Result<PathBuf, String> {
     if path.is_file() {
         return Ok(path);
     }
-    std::fs::create_dir_all(models_dir()).map_err(|e| e.to_string())?;
-    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{file}");
-    let response = ureq::get(&url)
-        .call()
-        .map_err(|e| format!("Could not download {file}: {e}"))?;
+    download(&format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{file}"), &path)?;
+    Ok(path)
+}
+
+/// Saves `url` at `path`, through a `.part` file so an interrupted download is not mistaken for
+/// a model.
+pub fn download(url: &str, path: &Path) -> Result<(), String> {
+    let file = path.file_name().unwrap_or_default().to_string_lossy();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let response = ureq::get(url).call().map_err(|e| format!("Could not download {file}: {e}"))?;
     let partial = path.with_extension("part");
     let mut out = std::fs::File::create(&partial).map_err(|e| e.to_string())?;
-    std::io::copy(&mut response.into_reader(), &mut out)
-        .map_err(|e| format!("Could not download {file}: {e}"))?;
-    std::fs::rename(&partial, &path).map_err(|e| e.to_string())?;
-    Ok(path)
+    std::io::copy(&mut response.into_reader(), &mut out).map_err(|e| format!("Could not download {file}: {e}"))?;
+    std::fs::rename(&partial, path).map_err(|e| e.to_string())
 }
 
 pub struct Transcriber {

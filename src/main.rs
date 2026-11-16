@@ -8,17 +8,19 @@ use hermes_voice::audio::{list_devices, DeviceSpec, Mic, Segmenter, SpeechDetect
 use hermes_voice::gemini::{load_gemini_key, GeminiSpeaker, GeminiTranscriber};
 use hermes_voice::hermes::{load_api_key, HermesClient};
 use hermes_voice::stt::{Stt, Transcriber};
+use hermes_voice::wakeword::{resolve_model, WakeWord};
 
 const BASE_URL: &str = "http://127.0.0.1:8642";
-const USAGE: &str = "usage: hermes-voice [--wake PHRASE] [--open-mic] [--wake-model M] [--show-heard]
-                    [--device D] [--list-devices] [--local] [--stt-model M]
+const USAGE: &str = "usage: hermes-voice [--wake PHRASE] [--open-mic] [--wake-model FILE]
+                    [--wake-threshold F] [--show-scores] [--device D] [--list-devices] [--local] [--stt-model M]
                     [--tts-model M] [--voice V] [--vad-threshold F] [--end-silence-ms N]";
 
 struct Args {
     wake: String,
     open_mic: bool,
-    wake_model: String,
-    show_heard: bool,
+    wake_model: Option<String>,
+    wake_threshold: f32,
+    show_scores: bool,
     device: Option<DeviceSpec>,
     list_devices: bool,
     local: bool,
@@ -36,10 +38,11 @@ fn fail(message: impl std::fmt::Display) -> ! {
 
 fn parse_args() -> Args {
     let mut args = Args {
-        wake: "hey hermes".into(),
+        wake: "hey john".into(),
         open_mic: false,
-        wake_model: "base.en".into(),
-        show_heard: false,
+        wake_model: None,
+        wake_threshold: 0.5,
+        show_scores: false,
         device: None,
         list_devices: false,
         local: false,
@@ -59,8 +62,15 @@ fn parse_args() -> Args {
         match flag.as_str() {
             "--wake" => args.wake = value(),
             "--open-mic" => args.open_mic = true,
-            "--wake-model" => args.wake_model = value(),
-            "--show-heard" => args.show_heard = true,
+            "--wake-model" => args.wake_model = Some(value()),
+            "--wake-threshold" => {
+                args.wake_threshold = value()
+                    .parse()
+                    .ok()
+                    .filter(|t| (0.0..=1.0).contains(t))
+                    .unwrap_or_else(|| fail("--wake-threshold must be a number from 0 to 1"))
+            }
+            "--show-scores" => args.show_scores = true,
             "--device" => args.device = Some(DeviceSpec::parse(&value())),
             "--list-devices" => args.list_devices = true,
             "--local" => args.local = true,
@@ -136,15 +146,12 @@ fn main() {
             Some(GeminiSpeaker::new(&key, &args.tts_model, &args.voice)),
         )
     };
-    let (wake, wake_transcriber) = if args.open_mic {
+    let (wake, wake_word) = if args.open_mic {
         (None, None)
     } else {
-        let hotword = args.wake.split_whitespace().last().map(|w| {
-            let mut c = w.chars();
-            c.next().map(|f| f.to_uppercase().chain(c.flat_map(char::to_lowercase)).collect()).unwrap_or_default()
-        });
-        let wake_stt: Box<dyn Stt> = Box::new(Transcriber::new(&args.wake_model, hotword));
-        (Some(args.wake.clone()), Some(wake_stt))
+        let model = resolve_model(&args.wake, args.wake_model.as_deref()).unwrap_or_else(|e| fail(e));
+        let detector = WakeWord::load(&model).unwrap_or_else(|e| fail(e));
+        (Some(args.wake.clone()), Some(detector))
     };
     let config = Config {
         client: HermesClient::new(&api_key, BASE_URL),
@@ -153,8 +160,9 @@ fn main() {
         device: args.device,
         device_name,
         transcriber: Some(transcriber),
-        wake_transcriber,
-        show_heard: args.show_heard,
+        wake_word,
+        wake_threshold: args.wake_threshold,
+        show_scores: args.show_scores,
         segmenter: Segmenter::new(Box::new(detector), args.end_silence_ms),
         speaker,
     };
