@@ -65,6 +65,8 @@ struct Shared {
     transcribing: bool,
     loading: bool,
     speaking: bool,
+    /// The wake phrase cut the reply being spoken. Mic frames count again from that moment.
+    barged: bool,
     speech_waiting: bool,
     stop_sending: bool,
     retry_mic: bool,
@@ -178,6 +180,28 @@ impl Shared {
         self.mute_gen += 1;
         self.reset_segmenter();
         self.utterances.clear();
+    }
+
+    /// The wake phrase was heard over a spoken reply: cut it, drop queued replies, and listen.
+    fn barge_in(&mut self, stop_speech: &AtomicBool) {
+        stop_speech.store(true, Ordering::Relaxed);
+        self.speech.clear();
+        self.barged = true;
+    }
+
+    /// Playback is over. After a barge-in the wake window and the command already being heard
+    /// stay. Otherwise the mic opens for a short follow-up.
+    fn speech_ended(&mut self) {
+        if !std::mem::take(&mut self.barged) {
+            self.reset_segmenter();
+            if !self.muted {
+                if let Some(gate) = &mut self.gate {
+                    gate.open_for(FOLLOW_UP);
+                }
+            }
+        }
+        self.speaking = false;
+        self.speech_waiting = false;
     }
 
     /// Room talk while asleep must not hold a reply. Once the gate is open, or when there is
@@ -369,7 +393,8 @@ fn capture_loop(core: &Core, device: Option<DeviceSpec>, mut wake_word: Option<W
             return;
         }
     };
-    // Whether the wake word model is hearing the room, rather than muted or our own voice.
+    // Whether the wake word model has heard the room since the last mute. It also runs during
+    // replies, so "hey john" can cut one off.
     let mut listening = false;
     while !core.quitting() {
         if core.lock().muted {
@@ -385,12 +410,11 @@ fn capture_loop(core: &Core, device: Option<DeviceSpec>, mut wake_word: Option<W
         if let Some(frame) = mic.read(AUDIO_WAIT) {
             // Runs outside the lock: a few ms every 80 ms on a Raspberry Pi.
             let score = wake_word.as_mut().and_then(|detector| {
-                let now = !core.lock().speaking;
-                if now != listening {
+                if !listening {
                     detector.reset();
-                    listening = now;
+                    listening = true;
                 }
-                if now { detector.feed(&frame) } else { None }
+                detector.feed(&frame)
             });
             take_frame(core, frame, score);
         }
@@ -429,7 +453,16 @@ fn recover_mic(core: &Core, mic: &mut Mic) {
 fn take_frame(core: &Core, frame: Vec<i16>, score: Option<f32>) {
     let mut guard = core.lock();
     let s = &mut *guard;
-    if s.speaking || s.muted {
+    if s.muted {
+        return;
+    }
+    // Our own voice is not heard, except by the wake word model.
+    // ponytail: no echo cancelling. If replies cut themselves off, raise --wake-threshold.
+    if s.speaking && !s.barged {
+        if score.is_some_and(|score| hear_wake(core, s, score)) {
+            s.barge_in(&core.stop_speech);
+            s.log_line("Cut off by the wake phrase.");
+        }
         return;
     }
     s.frame_count += 1;
@@ -474,20 +507,22 @@ fn take_frame(core: &Core, frame: Vec<i16>, score: Option<f32>) {
     s.hearing = s.segmenter.as_ref().is_some_and(|seg| seg.in_speech) && !s.asleep();
 }
 
-fn hear_wake(core: &Core, s: &mut Shared, score: f32) {
+/// True when the wake phrase was just heard and the gate opened.
+fn hear_wake(core: &Core, s: &mut Shared, score: f32) -> bool {
     let reading = s.trigger.read(score, core.wake_threshold);
     if let (true, Some(peak)) = (core.show_scores, reading.peak) {
         s.log_line(format!("wake score {peak:.2}"));
     }
     if !reading.fired {
-        return;
+        return false;
     }
-    let Some(gate) = &mut s.gate else { return };
+    let Some(gate) = &mut s.gate else { return false };
     gate.wake();
     s.bell = true;
     if let Some(seg) = s.segmenter.as_ref().filter(|seg| seg.in_speech) {
         s.wake_mark = Some((seg.samples(), seg.speech_ms()));
     }
+    true
 }
 
 // ---------------------------------------------------------------- transcription
@@ -655,17 +690,9 @@ fn speak_loop(core: &Core, speaker: Arc<GeminiSpeaker>) {
         if let Err(e) = speaker.say(&text, &core.stop_speech) {
             core.log(e);
         }
-        core.pause(SPEAK_TAIL, |_| false);
-        let mut s = core.lock();
-        s.reset_segmenter();
-        s.speaking = false;
-        s.speech_waiting = false;
-        // Speech that starts within the window keeps the gate open until it is transcribed.
-        if !s.muted {
-            if let Some(gate) = &mut s.gate {
-                gate.open_for(FOLLOW_UP);
-            }
-        }
+        core.pause(SPEAK_TAIL, |s| s.barged);
+        // Speech that starts within the follow-up window keeps the gate open until transcribed.
+        core.lock().speech_ended();
     }
 }
 
@@ -1103,6 +1130,22 @@ mod tests {
         s.heard_awake = true;
         s.wake_mark = Some((8000, 300));
         assert_eq!(s.finish_utterance(vec![1; 32000], 1200).unwrap().len(), 32000);
+    }
+
+    #[test]
+    fn wake_phrase_over_a_reply_cuts_it_and_keeps_listening() {
+        let stop = AtomicBool::new(false);
+        let mut s = Shared { gate: Some(WakeGate::new(Duration::from_secs(60))), speaking: true, ..Shared::default() };
+        s.speech.push_back("next reply".into());
+        s.gate.as_mut().unwrap().wake();
+        s.barge_in(&stop);
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(s.speech.is_empty(), "queued replies are dropped");
+        s.speech_ended();
+        assert!(!s.speaking && !s.barged);
+        // The 60 s wake window stays, not the zero-length follow-up a normal end would give.
+        assert!(!s.gate.as_mut().unwrap().expire(false));
+        assert!(!s.asleep());
     }
 
     #[test]
