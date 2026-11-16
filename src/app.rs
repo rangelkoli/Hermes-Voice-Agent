@@ -17,12 +17,13 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use serde_json::Value;
 
-use crate::audio::{level, DeviceSpec, Mic, Segmenter, MIC_SILENT_HINT};
+use crate::audio::{level, DeviceSpec, Mic, Segmenter, MIC_SILENT_HINT, SAMPLE_RATE};
 use crate::gemini::{speakable, GeminiSpeaker};
 use crate::hermes::{HermesClient, HermesError, RunEvent, TERMINAL};
 use crate::orb::{Orb, FPS};
 use crate::stt::{is_noise, wake_match, Stt};
 use crate::wake::WakeGate;
+use crate::wakeword::{Trigger, WakeWord};
 
 // ponytail: a dead mic is reopened after a fixed 2 seconds. Quit and mute return early.
 const MIC_RETRY: Duration = Duration::from_secs(2);
@@ -36,6 +37,14 @@ const SPEAK_WAIT: Duration = Duration::from_secs(30);
 const SPEAK_TAIL: Duration = Duration::from_millis(300);
 // ponytail: after a spoken reply the mic stays open 2 seconds for a follow-up, no wake phrase.
 const FOLLOW_UP: Duration = Duration::from_secs(2);
+/// Audio kept from before the moment the wake word fired, enough for the phrase itself. Talk
+/// further back in the same breath is not sent.
+const WAKE_LEAD: usize = 3 * SAMPLE_RATE as usize / 2;
+/// Less speech than this after the wake word fires is the end of the phrase, not a command.
+// ponytail: from Piper voices with the "hey jarvis" model. The phrase alone left 60 to 120 ms;
+// "stop" left 240 to 390 ms. Raise it if "hey john" alone gets sent; lower it if short
+// commands are dropped.
+const COMMAND_MIN_MS: u32 = 180;
 const MAX_LOG: usize = 1000;
 const MAX_WIDTH: u16 = 96;
 const BACKGROUND: [u8; 3] = [30, 30, 30];
@@ -67,6 +76,11 @@ struct Shared {
     gate: Option<WakeGate>,
     segmenter: Option<Segmenter>,
     utterances: VecDeque<(Vec<i16>, u64)>,
+    /// The utterance being heard had a frame while the gate was open.
+    heard_awake: bool,
+    /// Where the wake word fired in the utterance being heard: (samples, speech ms).
+    wake_mark: Option<(usize, u32)>,
+    trigger: Trigger,
     logged_mic_errors: HashSet<String>,
     log: VecDeque<Entry>,
     level: f32,
@@ -130,6 +144,31 @@ impl Shared {
             seg.reset();
         }
         self.hearing = false;
+        self.heard_awake = false;
+        self.wake_mark = None;
+        self.trigger.reset();
+    }
+
+    /// What to transcribe of a finished utterance. Talk heard only while asleep is dropped here,
+    /// before it can reach the network. With the wake word in it, only the audio from just
+    /// before the phrase is kept, and the phrase alone is not sent.
+    fn finish_utterance(&mut self, utterance: Vec<i16>, speech_ms: u32) -> Option<Vec<i16>> {
+        let heard_awake = std::mem::take(&mut self.heard_awake);
+        let mark = self.wake_mark.take();
+        if self.gate.is_none() {
+            return Some(utterance);
+        }
+        if !heard_awake {
+            return None;
+        }
+        match mark {
+            None => Some(utterance),
+            Some((_, at_ms)) if speech_ms.saturating_sub(at_ms) < COMMAND_MIN_MS => None,
+            Some((at, _)) => {
+                let start = at.saturating_sub(WAKE_LEAD).min(utterance.len());
+                Some(utterance[start..].to_vec())
+            }
+        }
     }
 
     /// Drop the wake, partial speech, and all audio in flight.
@@ -158,8 +197,9 @@ pub struct Config {
     pub device: Option<DeviceSpec>,
     pub device_name: String,
     pub transcriber: Option<Box<dyn Stt>>,
-    pub wake_transcriber: Option<Box<dyn Stt>>,
-    pub show_heard: bool,
+    pub wake_word: Option<WakeWord>,
+    pub wake_threshold: f32,
+    pub show_scores: bool,
     pub segmenter: Segmenter,
     pub speaker: Option<GeminiSpeaker>,
 }
@@ -172,7 +212,8 @@ struct Core {
     client: HermesClient,
     session_id: String,
     wake: Option<String>,
-    show_heard: bool,
+    wake_threshold: f32,
+    show_scores: bool,
     speaks: bool,
 }
 
@@ -318,7 +359,7 @@ fn truthy(value: &Value) -> bool {
 
 // ---------------------------------------------------------------- capture
 
-fn capture_loop(core: &Core, device: Option<DeviceSpec>) {
+fn capture_loop(core: &Core, device: Option<DeviceSpec>, mut wake_word: Option<WakeWord>) {
     let mut mic = match Mic::new(device) {
         Ok(mic) => mic,
         Err(e) => {
@@ -328,9 +369,12 @@ fn capture_loop(core: &Core, device: Option<DeviceSpec>) {
             return;
         }
     };
+    // Whether the wake word model is hearing the room, rather than muted or our own voice.
+    let mut listening = false;
     while !core.quitting() {
         if core.lock().muted {
             mic.stop();
+            listening = false;
             core.pause(AUDIO_WAIT, |_| false);
             continue;
         }
@@ -339,7 +383,16 @@ fn capture_loop(core: &Core, device: Option<DeviceSpec>) {
             continue;
         }
         if let Some(frame) = mic.read(AUDIO_WAIT) {
-            take_frame(core, frame);
+            // Runs outside the lock: a few ms every 80 ms on a Raspberry Pi.
+            let score = wake_word.as_mut().and_then(|detector| {
+                let now = !core.lock().speaking;
+                if now != listening {
+                    detector.reset();
+                    listening = now;
+                }
+                if now { detector.feed(&frame) } else { None }
+            });
+            take_frame(core, frame, score);
         }
     }
 }
@@ -373,7 +426,7 @@ fn recover_mic(core: &Core, mic: &mut Mic) {
     }
 }
 
-fn take_frame(core: &Core, frame: Vec<i16>) {
+fn take_frame(core: &Core, frame: Vec<i16>, score: Option<f32>) {
     let mut guard = core.lock();
     let s = &mut *guard;
     if s.speaking || s.muted {
@@ -391,13 +444,26 @@ fn take_frame(core: &Core, frame: Vec<i16>) {
     } else {
         s.zero_frames = 0;
     }
+    if let Some(score) = score {
+        hear_wake(core, s, score);
+    }
+    let awake = !s.asleep();
+    let mut finished = None;
     if let Some(seg) = &mut s.segmenter {
-        if let Some(utterance) = seg.push(frame) {
+        let speech_ms = seg.speech_ms();
+        let utterance = seg.push(frame);
+        if awake && (seg.in_speech || utterance.is_some()) {
+            s.heard_awake = true;
+        }
+        finished = utterance.map(|u| (u, speech_ms));
+    }
+    if let Some((utterance, speech_ms)) = finished {
+        if let Some(utterance) = s.finish_utterance(utterance, speech_ms) {
             s.utterances.push_back((utterance, s.mute_gen));
-            if let Some(gate) = &mut s.gate {
-                gate.touch();
-            }
             core.changed.notify_all();
+        }
+        if let Some(gate) = &mut s.gate {
+            gate.touch();
         }
     }
     let busy = s.gate_busy();
@@ -408,9 +474,25 @@ fn take_frame(core: &Core, frame: Vec<i16>) {
     s.hearing = s.segmenter.as_ref().is_some_and(|seg| seg.in_speech) && !s.asleep();
 }
 
+fn hear_wake(core: &Core, s: &mut Shared, score: f32) {
+    let reading = s.trigger.read(score, core.wake_threshold);
+    if let (true, Some(peak)) = (core.show_scores, reading.peak) {
+        s.log_line(format!("wake score {peak:.2}"));
+    }
+    if !reading.fired {
+        return;
+    }
+    let Some(gate) = &mut s.gate else { return };
+    gate.wake();
+    s.bell = true;
+    if let Some(seg) = s.segmenter.as_ref().filter(|seg| seg.in_speech) {
+        s.wake_mark = Some((seg.samples(), seg.speech_ms()));
+    }
+}
+
 // ---------------------------------------------------------------- transcription
 
-fn load_models(core: &Core, models: [&mut Option<Box<dyn Stt>>; 2]) -> bool {
+fn load_models(core: &Core, models: [&mut Option<Box<dyn Stt>>; 1]) -> bool {
     core.lock().loading = true;
     let mut logged: Option<String> = None;
     let mut ok = true;
@@ -439,8 +521,8 @@ fn load_models(core: &Core, models: [&mut Option<Box<dyn Stt>>; 2]) -> bool {
     ok
 }
 
-fn stt_loop(core: &Core, mut transcriber: Option<Box<dyn Stt>>, mut wake_transcriber: Option<Box<dyn Stt>>) {
-    if !load_models(core, [&mut transcriber, &mut wake_transcriber]) {
+fn stt_loop(core: &Core, mut transcriber: Option<Box<dyn Stt>>) {
+    if !load_models(core, [&mut transcriber]) {
         return;
     }
     // Held aside so speech playback cannot drop a wake that arrived mid-transcription.
@@ -459,19 +541,9 @@ fn stt_loop(core: &Core, mut transcriber: Option<Box<dyn Stt>>, mut wake_transcr
                 }
             }
         };
-        let asleep = {
-            let s = core.lock();
-            if generation != s.mute_gen {
-                continue;
-            }
-            s.asleep()
-        };
-        if asleep && !open_if_wake(core, &mut wake_transcriber, &utterance, generation) {
-            continue;
-        }
         {
             let mut s = core.lock();
-            // The gate can close during the local check, after this utterance left the queue.
+            // The gate can close after this utterance was queued, such as after a command.
             if generation != s.mute_gen || s.asleep() {
                 continue;
             }
@@ -497,33 +569,6 @@ fn stt_loop(core: &Core, mut transcriber: Option<Box<dyn Stt>>, mut wake_transcr
             Ok(_) => {}
         }
     }
-}
-
-/// Hear one asleep utterance locally. True when the cloud should take it.
-fn open_if_wake(core: &Core, wake_transcriber: &mut Option<Box<dyn Stt>>, utterance: &[i16], generation: u64) -> bool {
-    let heard = match wake_transcriber.as_mut().map(|t| t.transcribe(utterance)) {
-        None => String::new(),
-        Some(Ok(heard)) => {
-            if core.show_heard {
-                core.log(format!("heard: {heard}"));
-            }
-            heard
-        }
-        Some(Err(e)) => {
-            core.log(e);
-            return false;
-        }
-    };
-    let mut s = core.lock();
-    if generation != s.mute_gen || !s.asleep() {
-        return false;
-    }
-    let Some(remainder) = wake_match(&heard, core.wake.as_deref().unwrap_or("")) else { return false };
-    if let Some(gate) = &mut s.gate {
-        gate.wake();
-    }
-    s.bell = true;
-    !remainder.is_empty() && !is_noise(&remainder)
 }
 
 // ---------------------------------------------------------------- sending
@@ -947,17 +992,18 @@ pub fn run(config: Config) -> std::io::Result<()> {
         client: config.client,
         session_id: config.session_id,
         wake: config.wake,
-        show_heard: config.show_heard,
+        wake_threshold: config.wake_threshold,
+        show_scores: config.show_scores,
         speaks: config.speaker.is_some(),
     });
     let spawn = |name: &str, f: Box<dyn FnOnce(&Core) + Send>| {
         let core = core.clone();
         std::thread::Builder::new().name(name.into()).spawn(move || f(&core)).expect("spawn thread");
     };
-    let device = config.device;
-    spawn("hermes-capture", Box::new(move |c| capture_loop(c, device)));
-    let (stt, wake_stt) = (config.transcriber, config.wake_transcriber);
-    spawn("hermes-stt", Box::new(move |c| stt_loop(c, stt, wake_stt)));
+    let (device, wake_word) = (config.device, config.wake_word);
+    spawn("hermes-capture", Box::new(move |c| capture_loop(c, device, wake_word)));
+    let stt = config.transcriber;
+    spawn("hermes-stt", Box::new(move |c| stt_loop(c, stt)));
     spawn("hermes-send", Box::new(send_loop));
     spawn("hermes-weather", Box::new(weather_loop));
     if let Some(speaker) = config.speaker {
@@ -1030,6 +1076,33 @@ mod tests {
         assert_eq!(clock(23, 59), "11:59 PM");
         assert_eq!(parse_weather("+51°F|Overcast \n"), Some(("51°F".into(), "Overcast".into())));
         assert_eq!(parse_weather("location not found: upstream error"), None);
+    }
+
+    #[test]
+    fn talk_heard_only_while_asleep_is_dropped() {
+        let mut s = Shared { gate: Some(WakeGate::new(Duration::from_secs(8))), ..Shared::default() };
+        assert_eq!(s.finish_utterance(vec![1; 100], 2000), None);
+        s.heard_awake = true;
+        assert_eq!(s.finish_utterance(vec![1; 100], 2000), Some(vec![1; 100]));
+        assert!(!s.heard_awake, "each utterance starts unheard");
+        let mut open_mic = Shared::default();
+        assert_eq!(open_mic.finish_utterance(vec![1; 100], 2000), Some(vec![1; 100]));
+    }
+
+    #[test]
+    fn wake_phrase_alone_is_not_sent_and_earlier_talk_is_cut() {
+        let mut s = Shared { gate: Some(WakeGate::new(Duration::from_secs(8))), ..Shared::default() };
+        s.heard_awake = true;
+        s.wake_mark = Some((5 * 16000, 1500));
+        assert_eq!(s.finish_utterance(vec![1; 6 * 16000], 1500 + COMMAND_MIN_MS - 30), None);
+        assert_eq!(s.wake_mark, None);
+        s.heard_awake = true;
+        s.wake_mark = Some((5 * 16000, 1500));
+        let kept = s.finish_utterance(vec![1; 6 * 16000], 2500).unwrap();
+        assert_eq!(kept.len(), 16000 + WAKE_LEAD);
+        s.heard_awake = true;
+        s.wake_mark = Some((8000, 300));
+        assert_eq!(s.finish_utterance(vec![1; 32000], 1200).unwrap().len(), 32000);
     }
 
     #[test]

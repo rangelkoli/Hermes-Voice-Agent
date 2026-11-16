@@ -5,6 +5,7 @@ pub mod hermes;
 pub mod orb;
 pub mod stt;
 pub mod wake;
+pub mod wakeword;
 
 use std::path::Path;
 

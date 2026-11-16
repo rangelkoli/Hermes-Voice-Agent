@@ -147,6 +147,16 @@ impl Segmenter {
         self.vad.reset();
     }
 
+    /// Samples so far in the utterance being heard, preroll included.
+    pub fn samples(&self) -> usize {
+        self.frames.len() * FRAME_SAMPLES
+    }
+
+    /// Speech so far in the utterance being heard.
+    pub fn speech_ms(&self) -> u32 {
+        self.speech_frames * FRAME_MS
+    }
+
     pub fn push(&mut self, frame: Vec<i16>) -> Option<Vec<i16>> {
         let speech = self.vad.is_speech(&frame);
         if !self.in_speech {
