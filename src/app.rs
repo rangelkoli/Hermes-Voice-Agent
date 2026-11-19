@@ -37,6 +37,9 @@ const SPEAK_WAIT: Duration = Duration::from_secs(30);
 const SPEAK_TAIL: Duration = Duration::from_millis(300);
 // ponytail: after a spoken reply the mic stays open 2 seconds for a follow-up, no wake phrase.
 const FOLLOW_UP: Duration = Duration::from_secs(2);
+// ponytail: after 60 seconds with nothing going on, the next request starts a new Hermes session.
+// Add an --idle-reset flag if the Pi needs another length.
+const IDLE_RESET: Duration = Duration::from_secs(60);
 /// Audio kept from before the moment the wake word fired, enough for the phrase itself. Talk
 /// further back in the same breath is not sent.
 const WAKE_LEAD: usize = 3 * SAMPLE_RATE as usize / 2;
@@ -91,6 +94,11 @@ struct Shared {
     zero_frames: u32,
     frame_count: u64,
     weather: Option<(String, String)>,
+    /// The Hermes session the next run joins.
+    session_id: String,
+    /// When the current session last saw a wake, a request, a run, or speech. None until the
+    /// session has its first request, so a fresh session is never reset again.
+    last_activity: Option<Instant>,
 }
 
 impl Shared {
@@ -204,6 +212,45 @@ impl Shared {
         self.speech_waiting = false;
     }
 
+    /// A run, an approval, speech, or a request is in flight. The session must not change.
+    fn conversation_busy(&self) -> bool {
+        self.run_id.is_some()
+            || self.approval.is_some()
+            || self.speaking
+            || self.speech_waiting
+            || self.transcribing
+            || !self.speech.is_empty()
+            || !self.pending.is_empty()
+    }
+
+    /// Keeps a session that has had a request open for another `IDLE_RESET`.
+    fn touch(&mut self, now: Instant) {
+        if self.last_activity.is_some() {
+            self.last_activity = Some(now);
+        }
+    }
+
+    /// Moves to `new_id` once the session has been idle for `IDLE_RESET`, and clears the
+    /// conversation on screen. Busy time counts as activity. True when it reset.
+    fn expire_session(&mut self, now: Instant, new_id: impl FnOnce() -> String) -> bool {
+        if self.conversation_busy() {
+            self.touch(now);
+            return false;
+        }
+        match self.last_activity {
+            Some(last) if now.saturating_duration_since(last) >= IDLE_RESET => {}
+            _ => return false,
+        }
+        self.session_id = new_id();
+        self.last_activity = None;
+        self.reply.clear();
+        self.pending.clear();
+        self.speech.clear();
+        self.log.clear();
+        self.log_line("New conversation");
+        true
+    }
+
     /// Room talk while asleep must not hold a reply. Once the gate is open, or when there is
     /// no gate, a result stays busy until it is delivered.
     fn gate_busy(&self) -> bool {
@@ -216,7 +263,6 @@ impl Shared {
 
 pub struct Config {
     pub client: HermesClient,
-    pub session_id: String,
     pub wake: Option<String>,
     pub device: Option<DeviceSpec>,
     pub device_name: String,
@@ -234,7 +280,6 @@ struct Core {
     quit: AtomicBool,
     stop_speech: Arc<AtomicBool>,
     client: HermesClient,
-    session_id: String,
     wake: Option<String>,
     wake_threshold: f32,
     show_scores: bool,
@@ -300,6 +345,7 @@ impl Core {
         }
         s.push_log(Entry::You(spoken.clone()));
         s.pending.push(spoken);
+        s.last_activity = Some(Instant::now());
         self.changed.notify_all();
     }
 
@@ -519,6 +565,7 @@ fn hear_wake(core: &Core, s: &mut Shared, score: f32) -> bool {
     let Some(gate) = &mut s.gate else { return false };
     gate.wake();
     s.bell = true;
+    s.touch(Instant::now());
     if let Some(seg) = s.segmenter.as_ref().filter(|seg| seg.in_speech) {
         s.wake_mark = Some((seg.samples(), seg.speech_ms()));
     }
@@ -617,7 +664,7 @@ fn auth_failed(core: &Core) {
 
 fn send_loop(core: &Core) {
     loop {
-        let (text, count) = {
+        let (text, count, session_id) = {
             let mut s = core.lock();
             while s.pending.is_empty() || s.stop_sending {
                 if core.quitting() {
@@ -625,9 +672,9 @@ fn send_loop(core: &Core) {
                 }
                 s = core.wait(s, AUDIO_WAIT);
             }
-            (s.pending.join("\n"), s.pending.len())
+            (s.pending.join("\n"), s.pending.len(), s.session_id.clone())
         };
-        let run_id = match core.client.start_run(&text, &core.session_id) {
+        let run_id = match core.client.start_run(&text, &session_id) {
             Ok(id) => id,
             Err(HermesError::Unavailable(_)) => {
                 core.lock().offline = true;
@@ -887,6 +934,15 @@ fn draw_sides(frame: &mut Frame, orb_area: Rect, weather: Option<&(String, Strin
     }
 }
 
+/// A Hermes session id from the local time, such as `voice-20261119-093000`.
+pub fn session_id() -> String {
+    let tm = local_now();
+    format!(
+        "voice-{:04}{:02}{:02}-{:02}{:02}{:02}",
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec
+    )
+}
+
 pub fn local_now() -> libc::tm {
     // SAFETY: localtime_r only writes the struct we pass.
     unsafe {
@@ -1011,13 +1067,13 @@ pub fn run(config: Config) -> std::io::Result<()> {
         state: Mutex::new(Shared {
             gate: config.wake.as_ref().map(|_| WakeGate::new(Duration::from_secs(8))),
             segmenter: Some(config.segmenter),
+            session_id: session_id(),
             ..Shared::default()
         }),
         changed: Condvar::new(),
         quit: AtomicBool::new(false),
         stop_speech: Arc::new(AtomicBool::new(false)),
         client: config.client,
-        session_id: config.session_id,
         wake: config.wake,
         wake_threshold: config.wake_threshold,
         show_scores: config.show_scores,
@@ -1046,6 +1102,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
         if Instant::now() >= next_tick {
             next_tick += tick;
             let mut s = core.lock();
+            s.expire_session(Instant::now(), session_id);
             orb.tick(s.status(), s.level);
             if std::mem::take(&mut s.bell) {
                 bell();
@@ -1146,6 +1203,41 @@ mod tests {
         // The 60 s wake window stays, not the zero-length follow-up a normal end would give.
         assert!(!s.gate.as_mut().unwrap().expire(false));
         assert!(!s.asleep());
+    }
+
+    #[test]
+    fn idle_session_resets_after_a_minute_but_never_while_busy() {
+        let start = Instant::now();
+        let fresh = || "fresh".to_string();
+        let mut s = Shared { session_id: "old".into(), ..Shared::default() };
+        // No request yet: nothing to reset.
+        assert!(!s.expire_session(start + IDLE_RESET * 2, fresh));
+
+        s.last_activity = Some(start);
+        s.push_log(Entry::You("hello".into()));
+        // A follow-up inside the minute keeps the session.
+        assert!(!s.expire_session(start + IDLE_RESET - Duration::from_secs(1), fresh));
+        assert_eq!(s.session_id, "old");
+
+        // Busy past the minute: no reset, and the idle time restarts when it ends.
+        s.run_id = Some("r".into());
+        assert!(!s.expire_session(start + IDLE_RESET * 2, fresh));
+        s.run_id = None;
+        s.speaking = true;
+        assert!(!s.expire_session(start + IDLE_RESET * 3, fresh));
+        s.speaking = false;
+        s.approval = Some(Value::Null);
+        assert!(!s.expire_session(start + IDLE_RESET * 4, fresh));
+        s.approval = None;
+        assert!(!s.expire_session(start + IDLE_RESET * 5 - Duration::from_secs(1), fresh));
+        assert_eq!(s.session_id, "old");
+
+        assert!(s.expire_session(start + IDLE_RESET * 5, fresh));
+        assert_eq!(s.session_id, "fresh");
+        assert_eq!(s.last_activity, None);
+        assert!(matches!(&s.log.iter().collect::<Vec<_>>()[..], [Entry::Plain(t)] if t == "New conversation"));
+        // A fresh session is not reset again.
+        assert!(!s.expire_session(start + IDLE_RESET * 10, || "again".into()));
     }
 
     #[test]
