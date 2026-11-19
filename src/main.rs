@@ -114,14 +114,6 @@ fn check_hermes() {
     ))
 }
 
-fn session_id() -> String {
-    let tm = app::local_now();
-    format!(
-        "voice-{:04}{:02}{:02}-{:02}{:02}{:02}",
-        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec
-    )
-}
-
 fn main() {
     let args = parse_args();
     if args.list_devices {
@@ -155,7 +147,6 @@ fn main() {
     };
     let config = Config {
         client: HermesClient::new(&api_key, BASE_URL),
-        session_id: session_id(),
         wake,
         device: args.device,
         device_name,
