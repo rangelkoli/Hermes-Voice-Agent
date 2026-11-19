@@ -37,6 +37,12 @@ The Hermes key is read from `HERMES_API_KEY`. If that is unset, it is read from 
 
 `--local` transcribes with Whisper on this computer and does not speak replies. It needs no Gemini key.
 
+### Todo list
+
+On terminals 72 columns or wider, a todo list panel appears to the left of the conversation. On narrower terminals it hides automatically so the conversation stays readable.
+
+Todos are stored in `~/.config/hermes-voice/todos.md` in Markdown checklist format (`- [ ]` and `- [x]`), and the file is watched live for changes. The list persists across the 1-minute idle session reset and app restarts. Hermes is given the file path and format, so asking by voice to add, check off, edit, or remove todos updates the list on screen.
+
 ## Flags
 
 - `--wake` sets the wake phrase. Default `hey john`. The model is read from `~/.config/hermes-voice/<phrase>.onnx`, with spaces as underscores.
@@ -52,6 +58,7 @@ The Hermes key is read from `HERMES_API_KEY`. If that is unset, it is read from 
 - `--voice` chooses the spoken voice. Default `Kore`.
 - `--vad-threshold` is how sure speech detection must be. Default `0.5`. Raise it when room noise shows as hearing.
 - `--end-silence-ms` is the pause that ends a phrase. Default `1000`. Raise it when transcripts cut off mid-sentence.
+- `--todo-file` sets the Markdown file for the todo list. Default `~/.config/hermes-voice/todos.md`.
 
 ## Privacy
 

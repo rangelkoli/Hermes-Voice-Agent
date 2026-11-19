@@ -5,6 +5,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -22,6 +23,7 @@ use crate::gemini::{speakable, GeminiSpeaker};
 use crate::hermes::{HermesClient, HermesError, RunEvent, TERMINAL};
 use crate::orb::{Orb, FPS};
 use crate::stt::{is_noise, wake_match, Stt};
+use crate::todo::{ensure_todo_file, hermes_instructions, load_todos, TodoItem, TodoWatcher};
 use crate::wake::WakeGate;
 use crate::wakeword::{Trigger, WakeWord};
 
@@ -30,6 +32,8 @@ const MIC_RETRY: Duration = Duration::from_secs(2);
 // ponytail: a failed model download, or a failed send, is retried after a fixed 5 seconds.
 const RETRY: Duration = Duration::from_secs(5);
 const AUDIO_WAIT: Duration = Duration::from_millis(100);
+// ponytail: poll the backing todo file every 500 ms so external edits appear live on screen.
+const TODO_POLL: Duration = Duration::from_millis(500);
 const SILENT_FRAMES: u32 = 100;
 // ponytail: speech waits at most 30 seconds for the user to finish.
 const SPEAK_WAIT: Duration = Duration::from_secs(30);
@@ -50,6 +54,8 @@ const WAKE_LEAD: usize = 3 * SAMPLE_RATE as usize / 2;
 const COMMAND_MIN_MS: u32 = 180;
 const MAX_LOG: usize = 1000;
 const MAX_WIDTH: u16 = 96;
+const BODY_MAX_WIDTH: u16 = 128;
+const MIN_TWO_COL_WIDTH: u16 = 72;
 const BACKGROUND: [u8; 3] = [30, 30, 30];
 
 enum Entry {
@@ -88,6 +94,7 @@ struct Shared {
     trigger: Trigger,
     logged_mic_errors: HashSet<String>,
     log: VecDeque<Entry>,
+    todos: Vec<TodoItem>,
     level: f32,
     speech: VecDeque<String>,
     bell: bool,
@@ -272,6 +279,7 @@ pub struct Config {
     pub show_scores: bool,
     pub segmenter: Segmenter,
     pub speaker: Option<GeminiSpeaker>,
+    pub todo_path: PathBuf,
 }
 
 struct Core {
@@ -284,6 +292,8 @@ struct Core {
     wake_threshold: f32,
     show_scores: bool,
     speaks: bool,
+    todo_path: PathBuf,
+    todo_instructions: String,
 }
 
 impl Core {
@@ -674,7 +684,11 @@ fn send_loop(core: &Core) {
             }
             (s.pending.join("\n"), s.pending.len(), s.session_id.clone())
         };
-        let run_id = match core.client.start_run(&text, &session_id) {
+        let run_id = match core.client.start_run_with_instructions(
+            &text,
+            &session_id,
+            Some(&core.todo_instructions),
+        ) {
             Ok(id) => id,
             Err(HermesError::Unavailable(_)) => {
                 core.lock().offline = true;
@@ -697,8 +711,16 @@ fn send_loop(core: &Core) {
             s.reply.clear();
         }
         let result = core.client.events(&run_id, |event| {
-            let mut s = core.lock();
-            core.on_event(&mut s, event);
+            let refresh_todos = matches!(event.name.as_str(), "tool.completed" | "run.completed");
+            {
+                let mut s = core.lock();
+                core.on_event(&mut s, event);
+            }
+            if refresh_todos {
+                if let Ok(items) = load_todos(&core.todo_path) {
+                    core.lock().todos = items;
+                }
+            }
         });
         {
             let mut s = core.lock();
@@ -853,6 +875,86 @@ fn log_tail(log: &VecDeque<Entry>, width: usize, max: usize) -> Vec<Line<'static
     out
 }
 
+fn body_columns(area: Rect, y: u16, height: u16) -> (Option<Rect>, Option<Rect>, Rect) {
+    if area.width >= MIN_TWO_COL_WIDTH && height > 0 {
+        let body_width = area.width.min(BODY_MAX_WIDTH);
+        let body_x = area.x + (area.width - body_width) / 2;
+        let todo_w = (body_width * 30 / 100).clamp(24, 38);
+        let sep_w = 1;
+        let chat_w = body_width.saturating_sub(todo_w + sep_w);
+        (
+            Some(Rect::new(body_x, y, todo_w, height)),
+            Some(Rect::new(body_x + todo_w, y, sep_w, height)),
+            Rect::new(body_x + todo_w + sep_w, y, chat_w, height),
+        )
+    } else {
+        let chat_w = area.width.min(MAX_WIDTH);
+        let chat_x = area.x + (area.width - chat_w) / 2;
+        (None, None, Rect::new(chat_x, y, chat_w, height))
+    }
+}
+
+fn todo_lines(todos: &[TodoItem], width: usize, max_lines: usize) -> Vec<Line<'static>> {
+    if max_lines == 0 {
+        return vec![];
+    }
+    let header_style = Style::default().fg(Color::Rgb(0xd7, 0xba, 0x74)).add_modifier(Modifier::BOLD);
+    let dim_count = Style::default().fg(Color::Rgb(0x90, 0x90, 0x90));
+    let header = if todos.is_empty() {
+        Line::from(Span::styled("TODO", header_style))
+    } else {
+        let done = todos.iter().filter(|t| t.done).count();
+        Line::from(vec![
+            Span::styled("TODO", header_style),
+            Span::styled(format!("  {done}/{}", todos.len()), dim_count),
+        ])
+    };
+    let mut out = vec![header];
+    if max_lines == 1 {
+        return out;
+    }
+    if todos.is_empty() {
+        out.push(Line::styled("No todos", Style::default().fg(Color::Rgb(0x70, 0x70, 0x70))));
+        return out;
+    }
+
+    let text_width = width.saturating_sub(4).max(1);
+    let open_box = Style::default().fg(Color::Rgb(0x5f, 0xd0, 0xe0)).add_modifier(Modifier::BOLD);
+    let open_text = Style::default().fg(Color::Rgb(0xe0, 0xe0, 0xe0));
+    let done_box = Style::default().fg(Color::Rgb(0x3d, 0xde, 0x7a));
+    let done_text = Style::default().fg(Color::Rgb(0x78, 0x78, 0x78)).add_modifier(Modifier::CROSSED_OUT);
+
+    let mut entries: Vec<(usize, Line<'static>)> = vec![];
+    for (idx, item) in todos.iter().enumerate() {
+        let (prefix, prefix_style, text_style) = if item.done {
+            ("[x] ", done_box, done_text)
+        } else {
+            ("[ ] ", open_box, open_text)
+        };
+        for (i, line) in wrap(&item.text, text_width).into_iter().enumerate() {
+            let rendered = if i == 0 {
+                Line::from(vec![Span::styled(prefix, prefix_style), Span::styled(line, text_style)])
+            } else {
+                Line::from(vec![Span::raw("    "), Span::styled(line, text_style)])
+            };
+            entries.push((idx, rendered));
+        }
+    }
+
+    let body_cap = max_lines - 1;
+    if entries.len() <= body_cap {
+        out.extend(entries.into_iter().map(|(_, line)| line));
+    } else {
+        let keep = body_cap - 1;
+        let shown_items = entries.iter().take(keep).map(|(idx, _)| idx + 1).max().unwrap_or(0);
+        let remaining = todos.len().saturating_sub(shown_items);
+        out.extend(entries.into_iter().take(keep).map(|(_, line)| line));
+        let label = if remaining > 0 { format!("+{remaining} more") } else { "…".into() };
+        out.push(Line::styled(label, Style::default().fg(Color::Rgb(0x80, 0x80, 0x80))));
+    }
+    out
+}
+
 fn draw(frame: &mut Frame, s: &Shared, orb: &Orb, wake: Option<&str>, device: &str) {
     let area = frame.area();
     let bg = Color::Rgb(BACKGROUND[0], BACKGROUND[1], BACKGROUND[2]);
@@ -887,19 +989,42 @@ fn draw(frame: &mut Frame, s: &Shared, orb: &Orb, wake: Option<&str>, device: &s
     );
     take(1);
 
-    let inner = width.saturating_sub(4) as usize;
-    let log = log_tail(&s.log, inner, (rows * 35 / 100) as usize);
-    let log_area = take(log.len() as u16);
-    frame.render_widget(Paragraph::new(log), pad(log_area));
+    let (todo_area, divider_area, chat_area) = body_columns(area, y, room);
+    if let Some(todo_area) = todo_area {
+        let padded = pad(todo_area);
+        let lines = todo_lines(&s.todos, padded.width as usize, padded.height as usize);
+        frame.render_widget(Paragraph::new(lines), padded);
+    }
+    if let Some(div) = divider_area {
+        let sep: Vec<Line> = (0..div.height).map(|_| Line::raw("│")).collect();
+        frame.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Rgb(0x45, 0x45, 0x45))),
+            div,
+        );
+    }
 
-    if !s.reply.is_empty() {
+    let chat_inner = chat_area.width.saturating_sub(4) as usize;
+    let stream_lines: Vec<Line> = if !s.reply.is_empty() && chat_area.height > 0 {
         // ponytail: shows the newest text only; the full reply lands in the log when done
         let tail: String = s.reply.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
-        let lines = wrap(&format!("Hermes  {tail}"), inner);
-        let shown: Vec<Line> = lines[lines.len().saturating_sub(6)..].iter().cloned().map(Line::from).collect();
-        let stream_area = take(shown.len() as u16);
+        let lines = wrap(&format!("Hermes  {tail}"), chat_inner);
+        let cap = 6.min(chat_area.height as usize);
+        lines[lines.len().saturating_sub(cap)..].iter().cloned().map(Line::from).collect()
+    } else {
+        vec![]
+    };
+    let log_max = (chat_area.height as usize).saturating_sub(stream_lines.len());
+    let log = log_tail(&s.log, chat_inner, log_max);
+    let log_h = log.len() as u16;
+    if log_h > 0 {
+        let log_area = Rect::new(chat_area.x, chat_area.y, chat_area.width, log_h);
+        frame.render_widget(Paragraph::new(log), pad(log_area));
+    }
+    if !stream_lines.is_empty() {
+        let stream_h = stream_lines.len() as u16;
+        let stream_area = Rect::new(chat_area.x, chat_area.y + log_h, chat_area.width, stream_h);
         frame.render_widget(
-            Paragraph::new(shown).style(Style::default().fg(Color::Rgb(0x5f, 0xd0, 0xe0))),
+            Paragraph::new(stream_lines).style(Style::default().fg(Color::Rgb(0x5f, 0xd0, 0xe0))),
             pad(stream_area),
         );
     }
@@ -989,6 +1114,14 @@ fn weather_loop(core: &Core) {
     }
 }
 
+fn todo_loop(core: &Core, mut watcher: TodoWatcher) {
+    while core.pause(TODO_POLL, |_| false) {
+        if let Some(items) = watcher.poll() {
+            core.lock().todos = items;
+        }
+    }
+}
+
 fn pad(area: Rect) -> Rect {
     Rect::new(area.x + 2.min(area.width), area.y, area.width.saturating_sub(4), area.height)
 }
@@ -1063,11 +1196,16 @@ fn toggle_mute(core: &Core) {
 }
 
 pub fn run(config: Config) -> std::io::Result<()> {
+    let _ = ensure_todo_file(&config.todo_path);
+    let mut todo_watcher = TodoWatcher::new(config.todo_path.clone());
+    let initial_todos = todo_watcher.poll().unwrap_or_default();
+    let todo_instructions = hermes_instructions(&config.todo_path);
     let core = Arc::new(Core {
         state: Mutex::new(Shared {
             gate: config.wake.as_ref().map(|_| WakeGate::new(Duration::from_secs(8))),
             segmenter: Some(config.segmenter),
             session_id: session_id(),
+            todos: initial_todos,
             ..Shared::default()
         }),
         changed: Condvar::new(),
@@ -1078,6 +1216,8 @@ pub fn run(config: Config) -> std::io::Result<()> {
         wake_threshold: config.wake_threshold,
         show_scores: config.show_scores,
         speaks: config.speaker.is_some(),
+        todo_path: config.todo_path,
+        todo_instructions,
     });
     let spawn = |name: &str, f: Box<dyn FnOnce(&Core) + Send>| {
         let core = core.clone();
@@ -1089,6 +1229,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
     spawn("hermes-stt", Box::new(move |c| stt_loop(c, stt)));
     spawn("hermes-send", Box::new(send_loop));
     spawn("hermes-weather", Box::new(weather_loop));
+    spawn("hermes-todos", Box::new(move |c| todo_loop(c, todo_watcher)));
     if let Some(speaker) = config.speaker {
         let speaker = Arc::new(speaker);
         spawn("hermes-speak", Box::new(move |c| speak_loop(c, speaker)));
@@ -1252,5 +1393,259 @@ mod tests {
         assert_eq!(s.status(), "approval");
         s.mic_lost = true;
         assert_eq!(s.status(), "mic lost");
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn buffer_rect_text(buf: &ratatui::buffer::Buffer, rect: Rect) -> String {
+        let mut out = String::new();
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn todo_lines_wraps_indents_and_styles_open_vs_done() {
+        assert!(todo_lines(&[], 24, 0).is_empty());
+        let one = todo_lines(&[], 24, 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(line_text(&one[0]), "TODO");
+
+        let empty = todo_lines(&[], 24, 4);
+        assert_eq!(empty.len(), 2);
+        assert_eq!(line_text(&empty[0]), "TODO");
+        assert_eq!(line_text(&empty[1]), "No todos");
+        assert_eq!(empty[1].style.fg, Some(Color::Rgb(0x70, 0x70, 0x70)));
+
+        let items = vec![
+            TodoItem { text: "buy fresh groceries from market".into(), done: false },
+            TodoItem { text: "send quarterly report today".into(), done: true },
+        ];
+        let width = 18;
+        let lines = todo_lines(&items, width, 12);
+
+        assert_eq!(line_text(&lines[0]), "TODO  1/2");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Rgb(0xd7, 0xba, 0x74)));
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Rgb(0x90, 0x90, 0x90)));
+
+        for line in &lines[1..] {
+            assert!(
+                line_text(line).chars().count() <= width,
+                "line exceeded column width {width}: {:?}",
+                line_text(line)
+            );
+        }
+
+        // Open item: "[ ] " prefix + wrapped continuation indented by 4 spaces.
+        assert_eq!(lines[1].spans[0].content, "[ ] ");
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Rgb(0x5f, 0xd0, 0xe0)));
+        assert!(lines[1].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(lines[1].spans[1].style.fg, Some(Color::Rgb(0xe0, 0xe0, 0xe0)));
+        assert!(!lines[1].spans[1].style.add_modifier.contains(Modifier::CROSSED_OUT));
+
+        assert_eq!(lines[2].spans[0].content, "    ");
+        assert_eq!(lines[2].spans[1].style.fg, Some(Color::Rgb(0xe0, 0xe0, 0xe0)));
+
+        // Done item: "[x] " prefix + crossed-out dim text and indented continuation.
+        let done_idx = lines.iter().position(|l| l.spans[0].content == "[x] ").expect("done item line");
+        assert_eq!(lines[done_idx].spans[0].style.fg, Some(Color::Rgb(0x3d, 0xde, 0x7a)));
+        assert_eq!(lines[done_idx].spans[1].style.fg, Some(Color::Rgb(0x78, 0x78, 0x78)));
+        assert!(lines[done_idx].spans[1].style.add_modifier.contains(Modifier::CROSSED_OUT));
+
+        assert_eq!(lines[done_idx + 1].spans[0].content, "    ");
+        assert!(lines[done_idx + 1].spans[1].style.add_modifier.contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn todo_lines_respects_max_lines_and_shows_overflow() {
+        let items: Vec<TodoItem> =
+            (1..=5).map(|i| TodoItem { text: format!("task {i}"), done: i % 2 == 0 }).collect();
+
+        for max in 0..=8 {
+            let lines = todo_lines(&items, 24, max);
+            assert!(lines.len() <= max, "exceeded max_lines={max}: got {}", lines.len());
+        }
+
+        let cut = todo_lines(&items, 24, 4);
+        assert_eq!(cut.len(), 4);
+        assert_eq!(line_text(&cut[0]), "TODO  2/5");
+        assert_eq!(line_text(&cut[1]), "[ ] task 1");
+        assert_eq!(line_text(&cut[2]), "[x] task 2");
+        assert_eq!(line_text(&cut[3]), "+3 more");
+
+        let exact = todo_lines(&items, 24, 6);
+        assert_eq!(exact.len(), 6);
+        assert_eq!(line_text(&exact[5]), "[ ] task 5");
+
+        let single_long = vec![TodoItem { text: "alpha beta gamma delta epsilon zeta".into(), done: false }];
+        let truncated = todo_lines(&single_long, 14, 3);
+        assert_eq!(truncated.len(), 3);
+        assert_eq!(line_text(&truncated[2]), "…");
+    }
+
+    #[test]
+    fn body_columns_switches_at_narrow_threshold_and_caps_width() {
+        let (todo, div, chat) = body_columns(Rect::new(0, 0, MIN_TWO_COL_WIDTH - 1, 30), 10, 19);
+        assert!(todo.is_none() && div.is_none());
+        assert_eq!(chat, Rect::new(0, 10, MIN_TWO_COL_WIDTH - 1, 19));
+
+        let (todo, div, chat) = body_columns(Rect::new(0, 0, MIN_TWO_COL_WIDTH, 30), 10, 19);
+        let todo = todo.unwrap();
+        let div = div.unwrap();
+        assert_eq!(todo, Rect::new(0, 10, 24, 19));
+        assert_eq!(div, Rect::new(24, 10, 1, 19));
+        assert_eq!(chat, Rect::new(25, 10, 47, 19));
+        assert_eq!(todo.right(), div.x);
+        assert_eq!(div.right(), chat.x);
+
+        let (todo, div, chat) = body_columns(Rect::new(0, 0, 160, 40), 14, 25);
+        let todo = todo.unwrap();
+        let div = div.unwrap();
+        assert_eq!(todo, Rect::new(16, 14, 38, 25));
+        assert_eq!(div, Rect::new(54, 14, 1, 25));
+        assert_eq!(chat, Rect::new(55, 14, 89, 25));
+        assert_eq!(todo.width + div.width + chat.width, BODY_MAX_WIDTH);
+
+        let (todo, div, chat) = body_columns(Rect::new(0, 0, 120, 30), 10, 0);
+        assert!(todo.is_none() && div.is_none());
+        assert_eq!(chat.height, 0);
+    }
+
+    #[test]
+    fn draw_wide_renders_todo_and_chat_side_by_side_without_overlap() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut s = Shared::default();
+        s.todos = vec![
+            TodoItem { text: "water plants".into(), done: false },
+            TodoItem { text: "call dentist".into(), done: true },
+        ];
+        s.push_log(Entry::You("check my schedule".into()));
+        s.push_log(Entry::HermesLabel);
+        s.log_line("You have two meetings.");
+        s.reply = "Working on the summary now".into();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        let orb = Orb::default();
+        terminal.draw(|f| draw(f, &s, &orb, Some("hey john"), "Built-in Mic")).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let area = Rect::new(0, 0, 120, 32);
+        let header_rows = (32u16 * 35 / 100).clamp(7, 15) + 3;
+        let body_h = 32u16.saturating_sub(1).saturating_sub(header_rows);
+        let (todo_rect, div_rect, chat_rect) = body_columns(area, header_rows, body_h);
+        let todo_rect = todo_rect.unwrap();
+        let div_rect = div_rect.unwrap();
+
+        let header_text = buffer_rect_text(buf, Rect::new(0, 0, 120, header_rows));
+        assert!(!header_text.contains("TODO"));
+        assert!(!header_text.contains("water plants"));
+        assert!(!header_text.contains("check my schedule"));
+
+        let todo_text = buffer_rect_text(buf, todo_rect);
+        assert!(todo_text.contains("TODO  1/2"));
+        assert!(todo_text.contains("[ ] water plants"));
+        assert!(todo_text.contains("[x] call dentist"));
+        assert!(!todo_text.contains("check my schedule"));
+        assert!(!todo_text.contains("Working on the summary"));
+
+        for y in div_rect.y..div_rect.bottom() {
+            let cell = &buf[(div_rect.x, y)];
+            assert_eq!(cell.symbol(), "│");
+            assert_eq!(cell.fg, Color::Rgb(0x45, 0x45, 0x45));
+        }
+
+        let chat_text = buffer_rect_text(buf, chat_rect);
+        assert!(chat_text.contains("You  check my schedule"));
+        assert!(chat_text.contains("You have two meetings."));
+        assert!(chat_text.contains("Hermes  Working on the summary now"));
+        assert!(!chat_text.contains("TODO"));
+        assert!(!chat_text.contains("water plants"));
+
+        let footer_text = buffer_rect_text(buf, Rect::new(0, 31, 120, 1));
+        assert!(footer_text.contains("Mute"));
+        assert!(footer_text.contains("Quit"));
+        assert!(!footer_text.contains('│'));
+        assert!(!footer_text.contains("water plants"));
+        assert!(!footer_text.contains("Working on the summary"));
+    }
+
+    #[test]
+    fn draw_narrow_hides_todo_panel_and_renders_chat() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut s = Shared::default();
+        s.todos = vec![TodoItem { text: "secret todo item".into(), done: false }];
+        s.push_log(Entry::You("hello narrow screen".into()));
+        s.reply = "replying in single column".into();
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        let orb = Orb::default();
+        terminal.draw(|f| draw(f, &s, &orb, Some("hey john"), "USB Mic")).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let full = buffer_rect_text(buf, Rect::new(0, 0, 60, 30));
+        assert!(!full.contains("TODO"));
+        assert!(!full.contains("secret todo item"));
+        assert!(!full.contains('│'));
+        assert!(full.contains("You  hello narrow screen"));
+        assert!(full.contains("Hermes  replying in single column"));
+
+        let footer_text = buffer_rect_text(buf, Rect::new(0, 29, 60, 1));
+        assert!(footer_text.contains("Mute"));
+        assert!(footer_text.contains("Quit"));
+        assert!(!footer_text.contains("replying in single column"));
+    }
+
+    #[test]
+    fn draw_tiny_terminals_do_not_panic() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut s = Shared::default();
+        s.todos = vec![
+            TodoItem { text: "a very long todo item that wraps aggressively".into(), done: false },
+            TodoItem { text: "finished task".into(), done: true },
+        ];
+        for i in 0..20 {
+            s.push_log(Entry::You(format!("message number {i} with extra text")));
+        }
+        s.reply = "streaming text that is long enough to wrap across several lines".into();
+
+        let orb = Orb::default();
+        for (w, h) in [(20, 8), (10, 4), (4, 2), (80, 1), (0, 0)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| draw(f, &s, &orb, Some("hey john"), "Mic")).unwrap();
+        }
+    }
+
+    #[test]
+    fn expire_session_preserves_todos_while_clearing_chat() {
+        let start = Instant::now();
+        let mut s = Shared { session_id: "old".into(), last_activity: Some(start), ..Shared::default() };
+        let expected_todos = vec![
+            TodoItem { text: "keep this open task".into(), done: false },
+            TodoItem { text: "keep this done task".into(), done: true },
+        ];
+        s.todos = expected_todos.clone();
+        s.push_log(Entry::You("chat message".into()));
+        s.reply = "partial reply".into();
+
+        assert!(s.expire_session(start + IDLE_RESET, || "next".into()));
+        assert_eq!(s.session_id, "next");
+        assert!(s.reply.is_empty());
+        assert!(s.pending.is_empty());
+        assert!(s.speech.is_empty());
+        assert!(matches!(&s.log.iter().collect::<Vec<_>>()[..], [Entry::Plain(t)] if t == "New conversation"));
+        assert_eq!(s.todos, expected_todos);
     }
 }
