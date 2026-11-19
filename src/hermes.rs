@@ -57,6 +57,14 @@ fn status_error(code: u16) -> HermesError {
     }
 }
 
+fn run_payload(text: &str, session_id: &str, instructions: Option<&str>) -> Value {
+    let mut body = json!({"input": text, "session_id": session_id});
+    if let Some(inst) = instructions.filter(|s| !s.trim().is_empty()) {
+        body["instructions"] = json!(inst);
+    }
+    body
+}
+
 pub struct HermesClient {
     agent: ureq::Agent,
     base_url: String,
@@ -88,7 +96,16 @@ impl HermesClient {
     }
 
     pub fn start_run(&self, text: &str, session_id: &str) -> Result<String, HermesError> {
-        let body = self.post("/v1/runs", Some(json!({"input": text, "session_id": session_id})))?;
+        self.start_run_with_instructions(text, session_id, None)
+    }
+
+    pub fn start_run_with_instructions(
+        &self,
+        text: &str,
+        session_id: &str,
+        instructions: Option<&str>,
+    ) -> Result<String, HermesError> {
+        let body = self.post("/v1/runs", Some(run_payload(text, session_id, instructions)))?;
         body["run_id"]
             .as_str()
             .map(str::to_string)
@@ -142,5 +159,32 @@ impl HermesClient {
             body["request_id"] = json!(id);
         }
         self.post(&format!("/v1/runs/{run_id}/approval"), Some(body)).map(drop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_payload;
+
+    #[test]
+    fn run_payload_omits_instructions_when_none_or_whitespace() {
+        let none = run_payload("hello", "s1", None);
+        assert_eq!(none["input"], "hello");
+        assert_eq!(none["session_id"], "s1");
+        assert!(none.get("instructions").is_none());
+
+        let empty = run_payload("hello", "s1", Some(""));
+        assert!(empty.get("instructions").is_none());
+
+        let whitespace = run_payload("hello", "s1", Some(" \t\n "));
+        assert!(whitespace.get("instructions").is_none());
+    }
+
+    #[test]
+    fn run_payload_includes_instructions_when_present() {
+        let payload = run_payload("add milk", "s2", Some("Keep todos in /tmp/todos.md"));
+        assert_eq!(payload["input"], "add milk");
+        assert_eq!(payload["session_id"], "s2");
+        assert_eq!(payload["instructions"], "Keep todos in /tmp/todos.md");
     }
 }

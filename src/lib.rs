@@ -4,6 +4,7 @@ pub mod gemini;
 pub mod hermes;
 pub mod orb;
 pub mod stt;
+pub mod todo;
 pub mod wake;
 pub mod wakeword;
 

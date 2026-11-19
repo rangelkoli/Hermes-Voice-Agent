@@ -8,12 +8,13 @@ use hermes_voice::audio::{list_devices, DeviceSpec, Mic, Segmenter, SpeechDetect
 use hermes_voice::gemini::{load_gemini_key, GeminiSpeaker, GeminiTranscriber};
 use hermes_voice::hermes::{load_api_key, HermesClient};
 use hermes_voice::stt::{Stt, Transcriber};
+use hermes_voice::todo::resolve_todo_path;
 use hermes_voice::wakeword::{resolve_model, WakeWord};
 
 const BASE_URL: &str = "http://127.0.0.1:8642";
 const USAGE: &str = "usage: hermes-voice [--wake PHRASE] [--open-mic] [--wake-model FILE]
                     [--wake-threshold F] [--show-scores] [--device D] [--list-devices] [--local] [--stt-model M]
-                    [--tts-model M] [--voice V] [--vad-threshold F] [--end-silence-ms N]";
+                    [--tts-model M] [--voice V] [--vad-threshold F] [--end-silence-ms N] [--todo-file FILE]";
 
 struct Args {
     wake: String,
@@ -29,6 +30,8 @@ struct Args {
     voice: String,
     vad_threshold: f32,
     end_silence_ms: u32,
+    todo_file: Option<String>,
+    help: bool,
 }
 
 fn fail(message: impl std::fmt::Display) -> ! {
@@ -36,7 +39,11 @@ fn fail(message: impl std::fmt::Display) -> ! {
     exit(1)
 }
 
-fn parse_args() -> Args {
+fn parse_args_from<I, S>(iter: I) -> Result<Args, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut args = Args {
         wake: "hey john".into(),
         open_mic: false,
@@ -51,46 +58,67 @@ fn parse_args() -> Args {
         voice: "Kore".into(),
         vad_threshold: 0.5,
         end_silence_ms: 1000,
+        todo_file: None,
+        help: false,
     };
-    let mut it = std::env::args().skip(1);
-    while let Some(flag) = it.next() {
-        let (flag, inline) = match flag.split_once('=') {
+    let mut it = iter.into_iter().map(Into::into);
+    while let Some(raw) = it.next() {
+        let (flag, inline) = match raw.split_once('=') {
             Some((f, v)) => (f.to_string(), Some(v.to_string())),
-            None => (flag, None),
+            None => (raw, None),
         };
-        let mut value = || inline.clone().or_else(|| it.next()).unwrap_or_else(|| fail(format!("{flag} needs a value\n{USAGE}")));
+        let mut value = || {
+            inline
+                .clone()
+                .or_else(|| it.next())
+                .ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))
+        };
         match flag.as_str() {
-            "--wake" => args.wake = value(),
+            "--wake" => args.wake = value()?,
             "--open-mic" => args.open_mic = true,
-            "--wake-model" => args.wake_model = Some(value()),
+            "--wake-model" => args.wake_model = Some(value()?),
             "--wake-threshold" => {
-                args.wake_threshold = value()
+                args.wake_threshold = value()?
                     .parse()
                     .ok()
                     .filter(|t| (0.0..=1.0).contains(t))
-                    .unwrap_or_else(|| fail("--wake-threshold must be a number from 0 to 1"))
+                    .ok_or_else(|| "--wake-threshold must be a number from 0 to 1".to_string())?;
             }
             "--show-scores" => args.show_scores = true,
-            "--device" => args.device = Some(DeviceSpec::parse(&value())),
+            "--device" => args.device = Some(DeviceSpec::parse(&value()?)),
             "--list-devices" => args.list_devices = true,
             "--local" => args.local = true,
-            "--stt-model" => args.stt_model = Some(value()),
-            "--tts-model" => args.tts_model = value(),
-            "--voice" => args.voice = value(),
-            "--vad-threshold" => args.vad_threshold = value().parse().unwrap_or_else(|_| fail("--vad-threshold must be a number")),
+            "--stt-model" => args.stt_model = Some(value()?),
+            "--tts-model" => args.tts_model = value()?,
+            "--voice" => args.voice = value()?,
+            "--vad-threshold" => {
+                args.vad_threshold = value()?
+                    .parse()
+                    .map_err(|_| "--vad-threshold must be a number".to_string())?;
+            }
             "--end-silence-ms" => {
-                args.end_silence_ms = value()
+                args.end_silence_ms = value()?
                     .parse()
                     .ok()
                     .filter(|&n| n > 0)
-                    .unwrap_or_else(|| fail("--end-silence-ms must be greater than 0"))
+                    .ok_or_else(|| "--end-silence-ms must be greater than 0".to_string())?;
             }
+            "--todo-file" => args.todo_file = Some(value()?),
             "-h" | "--help" => {
-                println!("{USAGE}");
-                exit(0)
+                args.help = true;
+                return Ok(args);
             }
-            other => fail(format!("unknown argument {other}\n{USAGE}")),
+            other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
+    }
+    Ok(args)
+}
+
+fn parse_args() -> Args {
+    let args = parse_args_from(std::env::args().skip(1)).unwrap_or_else(|e| fail(e));
+    if args.help {
+        println!("{USAGE}");
+        exit(0)
     }
     args
 }
@@ -156,10 +184,44 @@ fn main() {
         show_scores: args.show_scores,
         segmenter: Segmenter::new(Box::new(detector), args.end_silence_ms),
         speaker,
+        todo_path: resolve_todo_path(args.todo_file.as_deref()),
     };
     if let Err(e) = app::run(config) {
         fail(e);
     }
     // Worker threads may sit in blocking reads; leave without joining them.
     exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args_from;
+
+    #[test]
+    fn todo_file_defaults_to_none() {
+        let args = parse_args_from(std::iter::empty::<&str>()).unwrap();
+        assert_eq!(args.todo_file, None);
+        assert!(!args.help);
+    }
+
+    #[test]
+    fn todo_file_parses_separate_and_inline_values() {
+        let separate = parse_args_from(["--todo-file", "/tmp/my.md"]).unwrap();
+        assert_eq!(separate.todo_file.as_deref(), Some("/tmp/my.md"));
+
+        let inline = parse_args_from(["--todo-file=/tmp/my.md"]).unwrap();
+        assert_eq!(inline.todo_file.as_deref(), Some("/tmp/my.md"));
+    }
+
+    #[test]
+    fn todo_file_requires_value() {
+        let err = parse_args_from(["--todo-file"]).err().unwrap();
+        assert!(err.contains("--todo-file needs a value"));
+    }
+
+    #[test]
+    fn help_flag_sets_help() {
+        assert!(parse_args_from(["-h"]).unwrap().help);
+        assert!(parse_args_from(["--help"]).unwrap().help);
+    }
 }
