@@ -963,7 +963,7 @@ fn draw(frame: &mut Frame, s: &Shared, orb: &Orb, wake: Option<&str>, device: &s
     let x = area.x + (area.width - width) / 2;
     let rows = area.height;
     let mut y = area.y;
-    let mut room = rows.saturating_sub(1); // footer
+    let mut room = rows;
     let mut take = |h: u16| {
         let h = h.min(room);
         let r = Rect::new(x, y, width, h);
@@ -1029,14 +1029,6 @@ fn draw(frame: &mut Frame, s: &Shared, orb: &Orb, wake: Option<&str>, device: &s
         );
     }
 
-    let key = Style::default().fg(Color::Rgb(0xff, 0xa6, 0x2b)).add_modifier(Modifier::BOLD);
-    let mut footer = vec![];
-    for (k, label) in [("m", "Mute"), ("esc", "Stop run"), ("y", "Approve"), ("n", "Deny"), ("q", "Quit")] {
-        footer.push(Span::styled(format!(" {k} "), key));
-        footer.push(Span::raw(format!("{label} ")));
-    }
-    let footer_area = Rect::new(area.x, area.y + rows.saturating_sub(1), area.width, rows.min(1));
-    frame.render_widget(Paragraph::new(Line::from(footer)).style(Style::default().bg(Color::Rgb(0x24, 0x24, 0x24))), footer_area);
 }
 
 /// Clock to the left of the orb, weather to the right, each centred in its free column.
@@ -1540,7 +1532,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 120, 32);
         let header_rows = (32u16 * 35 / 100).clamp(7, 15) + 3;
-        let body_h = 32u16.saturating_sub(1).saturating_sub(header_rows);
+        let body_h = 32u16.saturating_sub(header_rows);
         let (todo_rect, div_rect, chat_rect) = body_columns(area, header_rows, body_h);
         let todo_rect = todo_rect.unwrap();
         let div_rect = div_rect.unwrap();
@@ -1570,12 +1562,10 @@ mod tests {
         assert!(!chat_text.contains("TODO"));
         assert!(!chat_text.contains("water plants"));
 
-        let footer_text = buffer_rect_text(buf, Rect::new(0, 31, 120, 1));
-        assert!(footer_text.contains("Mute"));
-        assert!(footer_text.contains("Quit"));
-        assert!(!footer_text.contains('│'));
-        assert!(!footer_text.contains("water plants"));
-        assert!(!footer_text.contains("Working on the summary"));
+        // No key hints: the device has no keyboard.
+        let full = buffer_rect_text(buf, area);
+        assert!(!full.contains("Mute"));
+        assert!(!full.contains("Quit"));
     }
 
     #[test]
@@ -1600,10 +1590,8 @@ mod tests {
         assert!(full.contains("You  hello narrow screen"));
         assert!(full.contains("Hermes  replying in single column"));
 
-        let footer_text = buffer_rect_text(buf, Rect::new(0, 29, 60, 1));
-        assert!(footer_text.contains("Mute"));
-        assert!(footer_text.contains("Quit"));
-        assert!(!footer_text.contains("replying in single column"));
+        assert!(!full.contains("Mute"));
+        assert!(!full.contains("Quit"));
     }
 
     #[test]
