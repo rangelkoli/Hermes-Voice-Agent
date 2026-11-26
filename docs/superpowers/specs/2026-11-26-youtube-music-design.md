@@ -63,11 +63,11 @@ Tools:
 | `stop` | Ends mpv. |
 | `set_volume(percent)` | Sets mpv's `volume` property, 0 to 100. |
 
-Search uses `https://music.youtube.com/search?q=<query>#songs` with `--flat-playlist`, which returns songs rather than music videos. The mix URL is `https://music.youtube.com/watch?v=<id>&list=RDAMVM<id>`. Both were tested on the Mac: search took about 1.2 s. mpv only expands the mix into a playlist when started with `--ytdl-raw-options=yes-playlist=`. Without it, mpv plays the one song and exits.
+Search uses `https://music.youtube.com/search?q=<query>#songs` with `--flat-playlist`, which returns songs rather than music videos. The mix URL is `https://music.youtube.com/watch?v=<id>&list=RDAMVM<id>`. Both were tested on the Mac: search took about 1.2 s. mpv only expands the mix into a playlist when started with `--ytdl-raw-options=yes-playlist=`. Without it, mpv plays the one song and exits. The mix is capped at 50 songs with `playlist-end=50`: the full mix is about 480 songs and took 45 s to list before the first note, while 50 songs start in about 12 s.
 
 Control goes over mpv's JSON IPC socket at `~/.config/hermes-voice/mpv.sock`, with `HERMES_VOICE_MPV_SOCKET` as the override. The socket is the only record of a running player, so a player started before Hermes restarted can still be controlled. Control calls return "Nothing is playing." at once when the socket does not answer.
 
-`play` replies only after mpv reports that audio has started, waiting up to 15 s. If mpv exits or the wait runs out, it replies that playback could not start and that `yt-dlp` may need updating.
+`play` replies only after mpv reports that audio has started, waiting up to 45 s. YouTube holds each new stream back about 6 s, so a start takes about 12 s on the Mac. If mpv exits or the wait runs out, it replies that playback could not start and that `yt-dlp` may need updating.
 
 "Play some music" needs no special tool: Hermes chooses a seed query and calls `play`.
 
@@ -79,7 +79,7 @@ The server and the voice agent read the same socket path and the same override.
 
 ### Prompt
 
-One sentence is added to the per-run instructions the voice agent sends to Hermes: music requests go to the `mcp_youtube_music_*` tools, and the spoken reply is a short "Playing <title>".
+One sentence is added to the per-run instructions the voice agent sends to Hermes: music requests go to the `youtube_music` tools (Hermes 0.23.1 names them `mcp__youtube_music__play` and so on, so the prompt names the server, not a prefix), and the spoken reply is a short "Playing <title>".
 
 ## Risks
 

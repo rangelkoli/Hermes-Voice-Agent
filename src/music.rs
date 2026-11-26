@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 
 /// Sentence added to every Hermes run so music requests reach the MCP tools.
 pub const INSTRUCTIONS: &str = "When the user asks to play, pause, resume, skip, or stop music, or to change its volume, \
-    call the `mcp_youtube_music_*` tools. For a request that names no song, choose a fitting search query yourself. \
-    After `mcp_youtube_music_play` succeeds, reply with only `Playing <title>`.";
+    call the `youtube_music` tools: play, pause, resume, next, stop, set_volume. For a request that names no song, \
+    choose a fitting search query yourself. Starting a song can take 15 seconds. After play succeeds, reply with only \
+    `Playing <title>`. If play fails, say so once and do not retry.";
 
 /// A stuck player must not hold up the voice loop.
 const TIMEOUT: Duration = Duration::from_millis(200);
@@ -205,6 +206,8 @@ mod tests {
 
     #[test]
     fn instructions_name_the_tools() {
-        assert!(INSTRUCTIONS.contains("mcp_youtube_music_"));
+        // Hermes prefixes MCP tool names differently between versions, so only the server is named.
+        assert!(INSTRUCTIONS.contains("`youtube_music` tools"));
+        assert!(!INSTRUCTIONS.contains("mcp_"));
     }
 }

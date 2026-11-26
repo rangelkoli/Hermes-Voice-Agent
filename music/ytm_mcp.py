@@ -19,7 +19,11 @@ from mcp.server.mcpserver import MCPServer
 SOCKET = os.environ.get("HERMES_VOICE_MPV_SOCKET") or str(Path.home() / ".config/hermes-voice/mpv.sock")
 YT_DLP = os.environ.get("YT_DLP") or shutil.which("yt-dlp")
 MPV = os.environ.get("MPV") or shutil.which("mpv")
-PLAY_WAIT = 15.0  # seconds play waits for audio to start
+# Seconds play waits for audio. YouTube holds a new stream back about 6 s, and a start takes
+# about 12 s on a Mac. A Raspberry Pi is slower.
+PLAY_WAIT = 45.0
+# The full mix is about 480 songs and takes 45 s to list. 50 lists in about 2 s.
+MIX_SONGS = 50
 FAILED = "Could not start playback. yt-dlp may need updating."
 
 volume = 100  # last volume the user asked for, reused by the next play
@@ -56,8 +60,8 @@ def mpv_args(url: str, volume: int) -> list[str]:
         "--no-terminal",
         "--input-ipc-server=" + SOCKET,
         "--ytdl-format=bestaudio",
-        # Without this mpv plays the one song and ignores the rest of the mix.
-        "--ytdl-raw-options=yes-playlist=",
+        # Without yes-playlist mpv plays the one song and ignores the rest of the mix.
+        f"--ytdl-raw-options=yes-playlist=,playlist-end={MIX_SONGS}",
         "--script-opts=ytdl_hook-ytdl_path=" + YT_DLP,
         f"--volume={volume}",
         url,

@@ -45,7 +45,7 @@ Todos are stored in `~/.config/hermes-voice/todos.md` in Markdown checklist form
 
 ### Music
 
-Say "hey john, play One More Time" to play a song from YouTube Music, or "hey john, play some music" to let Hermes choose. Only the audio plays. When the song ends, similar songs follow. "Pause", "resume", "next", "stop the music", and "set the volume to 40" work the same way, after the wake phrase.
+Say "hey john, play One More Time" to play a song from YouTube Music, or "hey john, play some music" to let Hermes choose. Only the audio plays. A song takes about 12 seconds to start, because YouTube holds each new stream back for a few seconds. When the song ends, about 50 similar songs follow. "Pause", "resume", "next", "stop the music", and "set the volume to 40" work the same way, after the wake phrase.
 
 Music needs [mpv](https://mpv.io) and a current [yt-dlp](https://github.com/yt-dlp/yt-dlp). YouTube changes often, and an old `yt-dlp` finds the song but cannot play it. When Hermes says it could not start playback, run `pip install -U "yt-dlp[default]"`.
 

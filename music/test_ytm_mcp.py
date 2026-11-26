@@ -151,7 +151,7 @@ class YtmTest(unittest.TestCase):
         args = ytm_mcp.mpv_args("URL", 40)
         for flag in (
             "--no-video",
-            "--ytdl-raw-options=yes-playlist=",
+            "--ytdl-raw-options=yes-playlist=,playlist-end=50",
             "--volume=40",
             "--input-ipc-server=" + ytm_mcp.SOCKET,
         ):
