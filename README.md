@@ -58,7 +58,7 @@ hermes mcp add youtube_music \
   --args "$(pwd)/music/ytm_mcp.py"
 ```
 
-While it listens, works, or speaks, the music is turned down to `--duck-volume`, and it returns to its volume afterwards. `--open-mic` does not suit music, because lyrics the microphone picks up are sent as commands.
+While it listens, works, or speaks, the music is turned down to `--duck-volume` percent of its volume, and it comes back afterwards. A volume you ask for in that time is kept. `--open-mic` does not suit music, because lyrics the microphone picks up are sent as commands.
 
 ## Flags
 
@@ -76,7 +76,7 @@ While it listens, works, or speaks, the music is turned down to `--duck-volume`,
 - `--vad-threshold` is how sure speech detection must be. Default `0.5`. Raise it when room noise shows as hearing.
 - `--end-silence-ms` is the pause that ends a phrase. Default `1000`. Raise it when transcripts cut off mid-sentence.
 - `--todo-file` sets the Markdown file for the todo list. Default `~/.config/hermes-voice/todos.md`.
-- `--duck-volume` is the music volume from 0 to 100 while it listens, works, or speaks. Default `10`. Use `0` when lyrics are picked up as commands.
+- `--duck-volume` is the percent of its volume, from 0 to 100, that music keeps while it listens, works, or speaks. Default `10`. Use `0` when lyrics are picked up as commands.
 
 ## Privacy
 

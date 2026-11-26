@@ -73,7 +73,9 @@ Control goes over mpv's JSON IPC socket at `~/.config/hermes-voice/mpv.sock`, wi
 
 ### Ducking in the voice agent
 
-The voice agent lowers mpv's volume over the same IPC socket when the wake phrase fires and while a reply is being spoken, then restores it. If the socket is absent, this is a no-op. The duck level is a command-line flag, because the right level depends on the room and speaker.
+The voice agent turns the music down over the same IPC socket while it is listening, working, or speaking, then brings it back. If the socket is absent, this is a no-op. The duck level is a command-line flag, because the right level depends on the room and speaker.
+
+Ducking adds an mpv audio filter labelled `duck` (`lavfi=[volume=0.10]` at the default level) and removes it afterwards. It does not write mpv's `volume`. An earlier version saved and restored `volume`, and review found that a spoken "set the volume to 5" while ducked was overwritten by the old volume on restore. With the filter, the user's volume is never touched, and the ducked state lives in the player, so a voice agent that was killed while ducked is put right by the next one. The level is therefore a percent of the music's own volume, not an absolute volume.
 
 The server and the voice agent read the same socket path and the same override.
 

@@ -288,7 +288,7 @@ pub struct Config {
     pub segmenter: Segmenter,
     pub speaker: Option<GeminiSpeaker>,
     pub todo_path: PathBuf,
-    /// Music volume, 0 to 100, while the assistant is listening, working, or speaking.
+    /// Percent of its volume the music keeps while the assistant is listening, working, or speaking.
     pub duck_volume: u8,
 }
 
@@ -323,7 +323,7 @@ impl Core {
     /// Matches the music volume to the conversation. `allow` false always restores it.
     /// The state lock is released before the player is spoken to.
     fn duck(&self, allow: bool) {
-        let mut ducker = self.ducker.lock().unwrap_or_else(|e| e.into_inner());
+        let ducker = self.ducker.lock().unwrap_or_else(|e| e.into_inner());
         // Checked under the ducker lock, so no tick can duck again after the one made on quit.
         let engaged = allow && !self.quitting() && self.lock().engaged();
         ducker.tick(engaged);

@@ -47,33 +47,30 @@ fn request(path: &Path, command: Value) -> Option<Value> {
 }
 
 /// Lowers the music while the assistant is engaged and puts it back afterwards.
+///
+/// It adds an mpv audio filter labelled `duck` and removes it again. The player's own volume is
+/// never written, so a volume the user asks for while the music is ducked is kept. Whether the
+/// music is ducked is read from the player each time, so a song started mid-conversation is
+/// ducked, and a player left ducked by a killed voice agent is restored by the next one.
 pub struct Ducker {
     path: PathBuf,
-    level: f64,
-    /// The volume to return to. Some only while ducked.
-    saved: Option<f64>,
+    /// Share of the music's volume left while ducked, 0 to 1.
+    factor: f64,
 }
 
 impl Ducker {
     pub fn new(path: PathBuf, level: u8) -> Self {
-        Self { path, level: f64::from(level), saved: None }
+        Self { path, factor: f64::from(level.min(100)) / 100.0 }
     }
 
     /// Call a few times a second. Never blocks longer than one socket timeout per request.
-    // ponytail: a volume the user sets at or below the duck level while ducked is not remembered.
-    // Track the user's volume in the MCP server if that matters.
-    pub fn tick(&mut self, engaged: bool) {
-        if !engaged {
-            if let Some(volume) = self.saved.take() {
-                request(&self.path, json!(["set_property", "volume", volume]));
-            }
-            return;
-        }
-        // Read every time: a song started mid-conversation, or a spoken volume change, comes in loud.
-        let volume = request(&self.path, json!(["get_property", "volume"])).and_then(|v| v.as_f64());
-        if let Some(volume) = volume.filter(|v| *v > self.level + 0.5) {
-            self.saved = Some(volume);
-            request(&self.path, json!(["set_property", "volume", self.level]));
+    pub fn tick(&self, engaged: bool) {
+        let Some(filters) = request(&self.path, json!(["get_property", "af"])) else { return };
+        let ducked = filters.as_array().is_some_and(|f| f.iter().any(|f| f["label"] == "duck"));
+        if engaged && !ducked {
+            request(&self.path, json!(["af", "add", format!("@duck:lavfi=[volume={:.2}]", self.factor)]));
+        } else if !engaged && ducked {
+            request(&self.path, json!(["af", "remove", "@duck"]));
         }
     }
 }
@@ -81,26 +78,26 @@ impl Ducker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
-    /// Answers volume requests the way mpv does, with an event line before each reply.
+    /// Answers audio filter requests the way mpv does, with an event line before each reply.
     struct FakeMpv {
         path: PathBuf,
-        volume: Arc<Mutex<f64>>,
-        sets: Arc<Mutex<Vec<f64>>>,
+        ducked: Arc<Mutex<bool>>,
+        /// Every command that was not a read, as JSON.
+        writes: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeMpv {
-        fn new(name: &str, volume: f64) -> Self {
+        fn new(name: &str, ducked: bool) -> Self {
             let path = PathBuf::from(format!("/tmp/hv-mpv-{}-{name}.sock", std::process::id()));
             let _ = std::fs::remove_file(&path);
             let listener = UnixListener::bind(&path).unwrap();
-            let volume = Arc::new(Mutex::new(volume));
-            let sets = Arc::new(Mutex::new(Vec::new()));
-            let (v, s) = (volume.clone(), sets.clone());
+            let ducked = Arc::new(Mutex::new(ducked));
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let (d, w) = (ducked.clone(), writes.clone());
             std::thread::spawn(move || {
                 for conn in listener.incoming() {
                     let Ok(mut conn) = conn else { return };
@@ -111,29 +108,32 @@ mod tests {
                     let Ok(request) = serde_json::from_str::<Value>(&line) else { continue };
                     let command = &request["command"];
                     let reply = if command[0] == "get_property" {
-                        json!({"data": *v.lock().unwrap(), "error": "success"})
+                        let filters = if *d.lock().unwrap() { json!([{"name": "lavfi", "label": "duck"}]) } else { json!([]) };
+                        json!({"data": filters, "error": "success"})
                     } else {
-                        let value = command[2].as_f64().unwrap();
-                        *v.lock().unwrap() = value;
-                        s.lock().unwrap().push(value);
-                        json!({"error": "success"})
+                        if command[0] == "af" {
+                            *d.lock().unwrap() = command[1] == "add";
+                        }
+                        w.lock().unwrap().push(command.to_string());
+                        json!({"data": null, "error": "success"})
                     };
                     let _ = write!(conn, "{{\"event\":\"playback-restart\"}}\n{reply}\n");
                 }
             });
-            Self { path, volume, sets }
+            Self { path, ducked, writes }
         }
 
         fn path(&self) -> PathBuf {
             self.path.clone()
         }
 
-        fn sets(&self) -> Vec<f64> {
-            self.sets.lock().unwrap().clone()
+        fn writes(&self) -> Vec<String> {
+            self.writes.lock().unwrap().clone()
         }
 
-        fn set_volume(&self, volume: f64) {
-            *self.volume.lock().unwrap() = volume;
+        /// A new song replaced the player: it starts with no filters.
+        fn new_player(&self) {
+            *self.ducked.lock().unwrap() = false;
         }
     }
 
@@ -143,41 +143,64 @@ mod tests {
         }
     }
 
+    const ADD: &str = r#"["af","add","@duck:lavfi=[volume=0.10]"]"#;
+    const REMOVE: &str = r#"["af","remove","@duck"]"#;
+
     #[test]
-    fn duck_saves_volume_and_restores_it() {
-        let mpv = FakeMpv::new("restore", 80.0);
-        let mut d = Ducker::new(mpv.path(), 10);
+    fn duck_adds_the_filter_once_and_removes_it_once() {
+        let mpv = FakeMpv::new("once", false);
+        let d = Ducker::new(mpv.path(), 10);
         d.tick(true);
-        d.tick(true); // already ducked: no second write
-        assert_eq!(mpv.sets(), [10.0]);
+        d.tick(true);
+        assert_eq!(mpv.writes(), [ADD]);
         d.tick(false);
-        d.tick(false); // already restored: no second write
-        assert_eq!(mpv.sets(), [10.0, 80.0]);
+        d.tick(false);
+        assert_eq!(mpv.writes(), [ADD, REMOVE]);
     }
 
     #[test]
-    fn volume_set_while_ducked_is_what_gets_restored() {
-        let mpv = FakeMpv::new("changed", 80.0);
-        let mut d = Ducker::new(mpv.path(), 10);
-        d.tick(true);
-        mpv.set_volume(30.0); // "set the volume to 30" arrives through the MCP tool
+    fn ducking_never_writes_the_volume() {
+        // "Set the volume to 5" while ducked must still be 5 afterwards, so the volume is not ours.
+        let mpv = FakeMpv::new("volume", false);
+        let d = Ducker::new(mpv.path(), 10);
         d.tick(true);
         d.tick(false);
-        assert_eq!(mpv.sets(), [10.0, 10.0, 30.0]);
+        assert!(!mpv.writes().iter().any(|c| c.contains("set_property")), "{:?}", mpv.writes());
     }
 
     #[test]
-    fn volume_below_duck_level_is_left_alone() {
-        let mpv = FakeMpv::new("quiet", 5.0);
-        let mut d = Ducker::new(mpv.path(), 10);
+    fn a_song_started_while_engaged_is_ducked() {
+        let mpv = FakeMpv::new("newsong", false);
+        let d = Ducker::new(mpv.path(), 10);
         d.tick(true);
-        d.tick(false);
-        assert!(mpv.sets().is_empty());
+        mpv.new_player();
+        d.tick(true);
+        assert_eq!(mpv.writes(), [ADD, ADD]);
+    }
+
+    #[test]
+    fn a_player_left_ducked_is_restored() {
+        // The voice agent was killed mid-conversation and started again.
+        let mpv = FakeMpv::new("leftover", true);
+        Ducker::new(mpv.path(), 10).tick(false);
+        assert_eq!(mpv.writes(), [REMOVE]);
+    }
+
+    #[test]
+    fn duck_volume_sets_the_filter_strength() {
+        let mpv = FakeMpv::new("strength", false);
+        Ducker::new(mpv.path(), 25).tick(true);
+        mpv.new_player();
+        Ducker::new(mpv.path(), 0).tick(true);
+        assert_eq!(
+            mpv.writes(),
+            [r#"["af","add","@duck:lavfi=[volume=0.25]"]"#, r#"["af","add","@duck:lavfi=[volume=0.00]"]"#]
+        );
     }
 
     #[test]
     fn missing_socket_is_a_noop() {
-        let mut d = Ducker::new(PathBuf::from("/tmp/hv-mpv-does-not-exist.sock"), 10);
+        let d = Ducker::new(PathBuf::from("/tmp/hv-mpv-does-not-exist.sock"), 10);
         d.tick(true);
         d.tick(false);
     }
@@ -188,7 +211,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // Accepts into its backlog and never replies.
         let _listener = UnixListener::bind(&path).unwrap();
-        let mut d = Ducker::new(path.clone(), 10);
+        let d = Ducker::new(path.clone(), 10);
         let started = Instant::now();
         d.tick(true);
         assert!(started.elapsed() < Duration::from_secs(1));
