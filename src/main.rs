@@ -14,7 +14,8 @@ use hermes_voice::wakeword::{resolve_model, WakeWord};
 const BASE_URL: &str = "http://127.0.0.1:8642";
 const USAGE: &str = "usage: hermes-voice [--wake PHRASE] [--open-mic] [--wake-model FILE]
                     [--wake-threshold F] [--show-scores] [--device D] [--list-devices] [--local] [--stt-model M]
-                    [--tts-model M] [--voice V] [--vad-threshold F] [--end-silence-ms N] [--todo-file FILE]";
+                    [--tts-model M] [--voice V] [--vad-threshold F] [--end-silence-ms N] [--todo-file FILE]
+                    [--duck-volume N]";
 
 struct Args {
     wake: String,
@@ -31,6 +32,7 @@ struct Args {
     vad_threshold: f32,
     end_silence_ms: u32,
     todo_file: Option<String>,
+    duck_volume: u8,
     help: bool,
 }
 
@@ -59,6 +61,7 @@ where
         vad_threshold: 0.5,
         end_silence_ms: 1000,
         todo_file: None,
+        duck_volume: 10,
         help: false,
     };
     let mut it = iter.into_iter().map(Into::into);
@@ -104,6 +107,13 @@ where
                     .ok_or_else(|| "--end-silence-ms must be greater than 0".to_string())?;
             }
             "--todo-file" => args.todo_file = Some(value()?),
+            "--duck-volume" => {
+                args.duck_volume = value()?
+                    .parse()
+                    .ok()
+                    .filter(|&n| n <= 100)
+                    .ok_or_else(|| "--duck-volume must be a whole number from 0 to 100".to_string())?;
+            }
             "-h" | "--help" => {
                 args.help = true;
                 return Ok(args);
@@ -185,6 +195,7 @@ fn main() {
         segmenter: Segmenter::new(Box::new(detector), args.end_silence_ms),
         speaker,
         todo_path: resolve_todo_path(args.todo_file.as_deref()),
+        duck_volume: args.duck_volume,
     };
     if let Err(e) = app::run(config) {
         fail(e);
@@ -196,6 +207,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::parse_args_from;
+
+    #[test]
+    fn duck_volume_defaults_to_ten_and_rejects_out_of_range() {
+        assert_eq!(parse_args_from(std::iter::empty::<&str>()).unwrap().duck_volume, 10);
+        assert_eq!(parse_args_from(["--duck-volume", "0"]).unwrap().duck_volume, 0);
+        assert_eq!(parse_args_from(["--duck-volume=25"]).unwrap().duck_volume, 25);
+        for bad in ["101", "-1", "loud"] {
+            let err = parse_args_from(["--duck-volume", bad]).err().unwrap();
+            assert_eq!(err, "--duck-volume must be a whole number from 0 to 100");
+        }
+    }
 
     #[test]
     fn todo_file_defaults_to_none() {

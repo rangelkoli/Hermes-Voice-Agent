@@ -43,6 +43,23 @@ On terminals 72 columns or wider, a todo list panel appears to the left of the c
 
 Todos are stored in `~/.config/hermes-voice/todos.md` in Markdown checklist format (`- [ ]` and `- [x]`), and the file is watched live for changes. The list persists across the 1-minute idle session reset and app restarts. Hermes is given the file path and format, so asking by voice to add, check off, edit, or remove todos updates the list on screen.
 
+### Music
+
+Say "hey john, play One More Time" to play a song from YouTube Music, or "hey john, play some music" to let Hermes choose. Only the audio plays. When the song ends, similar songs follow. "Pause", "resume", "next", "stop the music", and "set the volume to 40" work the same way, after the wake phrase.
+
+Music needs [mpv](https://mpv.io) and a current [yt-dlp](https://github.com/yt-dlp/yt-dlp). YouTube changes often, and an old `yt-dlp` finds the song but cannot play it. When Hermes says it could not start playback, run `pip install -U "yt-dlp[default]"`.
+
+The music tools live in `music/ytm_mcp.py`. Register them with Hermes once, from this folder, then restart Hermes:
+
+```
+hermes mcp add youtube_music \
+  --command ~/.hermes/hermes-agent/venv/bin/python3 \
+  --env YT_DLP=$(which yt-dlp) MPV=$(which mpv) \
+  --args "$(pwd)/music/ytm_mcp.py"
+```
+
+While it listens, works, or speaks, the music is turned down to `--duck-volume`, and it returns to its volume afterwards. `--open-mic` does not suit music, because lyrics the microphone picks up are sent as commands.
+
 ## Flags
 
 - `--wake` sets the wake phrase. Default `hey john`. The model is read from `~/.config/hermes-voice/<phrase>.onnx`, with spaces as underscores.
@@ -59,10 +76,11 @@ Todos are stored in `~/.config/hermes-voice/todos.md` in Markdown checklist form
 - `--vad-threshold` is how sure speech detection must be. Default `0.5`. Raise it when room noise shows as hearing.
 - `--end-silence-ms` is the pause that ends a phrase. Default `1000`. Raise it when transcripts cut off mid-sentence.
 - `--todo-file` sets the Markdown file for the todo list. Default `~/.config/hermes-voice/todos.md`.
+- `--duck-volume` is the music volume from 0 to 100 while it listens, works, or speaks. Default `10`. Use `0` when lyrics are picked up as commands.
 
 ## Privacy
 
-> By default nothing leaves this computer until the wake phrase is heard. While waiting, a small wake word model on this computer listens for the phrase. Once it is heard, the rest of that utterance is sent to Google for transcription, starting 1.5 seconds before the phrase. Earlier talk in the same breath is not sent, and neither is the phrase said alone. If you pause after the phrase, the next utterance is sent. So is speech that starts within 2 seconds of a spoken reply ending. Reply text is sent to Google to be spoken. Transcripts also go to Hermes and its model provider. With `--open-mic`, every utterance is sent. With `--local`, nothing goes to Google.
+> By default nothing leaves this computer until the wake phrase is heard. While waiting, a small wake word model on this computer listens for the phrase. Once it is heard, the rest of that utterance is sent to Google for transcription, starting 1.5 seconds before the phrase. Earlier talk in the same breath is not sent, and neither is the phrase said alone. If you pause after the phrase, the next utterance is sent. So is speech that starts within 2 seconds of a spoken reply ending. Reply text is sent to Google to be spoken. Transcripts also go to Hermes and its model provider. With `--open-mic`, every utterance is sent. With `--local`, nothing goes to Google. Song searches and the music itself come from YouTube.
 
 ## Notes
 
