@@ -2,6 +2,7 @@ pub mod app;
 pub mod audio;
 pub mod gemini;
 pub mod hermes;
+pub mod music;
 pub mod orb;
 pub mod stt;
 pub mod todo;
