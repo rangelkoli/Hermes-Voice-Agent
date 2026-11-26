@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::audio::{level, DeviceSpec, Mic, Segmenter, MIC_SILENT_HINT, SAMPLE_RATE};
 use crate::gemini::{speakable, GeminiSpeaker};
 use crate::hermes::{HermesClient, HermesError, RunEvent, TERMINAL};
+use crate::music::{self, Ducker};
 use crate::orb::{Orb, FPS};
 use crate::stt::{is_noise, wake_match, Stt};
 use crate::todo::{ensure_todo_file, hermes_instructions, load_todos, TodoItem, TodoWatcher};
@@ -34,6 +35,8 @@ const RETRY: Duration = Duration::from_secs(5);
 const AUDIO_WAIT: Duration = Duration::from_millis(100);
 // ponytail: poll the backing todo file every 500 ms so external edits appear live on screen.
 const TODO_POLL: Duration = Duration::from_millis(500);
+/// How often the music volume is matched to what the assistant is doing.
+const DUCK_TICK: Duration = Duration::from_millis(250);
 const SILENT_FRAMES: u32 = 100;
 // ponytail: speech waits at most 30 seconds for the user to finish.
 const SPEAK_WAIT: Duration = Duration::from_secs(30);
@@ -137,6 +140,11 @@ impl Shared {
 
     fn asleep(&self) -> bool {
         self.gate.as_ref().is_some_and(|g| !g.awake)
+    }
+
+    /// Listening, working, or speaking, so music must stay quiet.
+    fn engaged(&self) -> bool {
+        self.gate.as_ref().is_some_and(|g| g.awake) || self.conversation_busy()
     }
 
     fn log_line(&mut self, text: impl Into<String>) {
@@ -280,6 +288,8 @@ pub struct Config {
     pub segmenter: Segmenter,
     pub speaker: Option<GeminiSpeaker>,
     pub todo_path: PathBuf,
+    /// Percent of its volume the music keeps while the assistant is listening, working, or speaking.
+    pub duck_volume: u8,
 }
 
 struct Core {
@@ -293,7 +303,8 @@ struct Core {
     show_scores: bool,
     speaks: bool,
     todo_path: PathBuf,
-    todo_instructions: String,
+    instructions: String,
+    ducker: Mutex<Ducker>,
 }
 
 impl Core {
@@ -307,6 +318,15 @@ impl Core {
 
     fn log(&self, text: impl Into<String>) {
         self.lock().log_line(text);
+    }
+
+    /// Matches the music volume to the conversation. `allow` false always restores it.
+    /// The state lock is released before the player is spoken to.
+    fn duck(&self, allow: bool) {
+        let ducker = self.ducker.lock().unwrap_or_else(|e| e.into_inner());
+        // Checked under the ducker lock, so no tick can duck again after the one made on quit.
+        let engaged = allow && !self.quitting() && self.lock().engaged();
+        ducker.tick(engaged);
     }
 
     fn wait<'a>(&self, guard: MutexGuard<'a, Shared>, timeout: Duration) -> MutexGuard<'a, Shared> {
@@ -687,7 +707,7 @@ fn send_loop(core: &Core) {
         let run_id = match core.client.start_run_with_instructions(
             &text,
             &session_id,
-            Some(&core.todo_instructions),
+            Some(&core.instructions),
         ) {
             Ok(id) => id,
             Err(HermesError::Unavailable(_)) => {
@@ -1106,6 +1126,13 @@ fn weather_loop(core: &Core) {
     }
 }
 
+/// Keeps music quiet while the assistant is engaged, and restores it once it is not.
+fn duck_loop(core: &Core) {
+    while core.pause(DUCK_TICK, |_| false) {
+        core.duck(true);
+    }
+}
+
 fn todo_loop(core: &Core, mut watcher: TodoWatcher) {
     while core.pause(TODO_POLL, |_| false) {
         if let Some(items) = watcher.poll() {
@@ -1191,7 +1218,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
     let _ = ensure_todo_file(&config.todo_path);
     let mut todo_watcher = TodoWatcher::new(config.todo_path.clone());
     let initial_todos = todo_watcher.poll().unwrap_or_default();
-    let todo_instructions = hermes_instructions(&config.todo_path);
+    let instructions = format!("{} {}", hermes_instructions(&config.todo_path), music::INSTRUCTIONS);
     let core = Arc::new(Core {
         state: Mutex::new(Shared {
             gate: config.wake.as_ref().map(|_| WakeGate::new(Duration::from_secs(8))),
@@ -1209,7 +1236,8 @@ pub fn run(config: Config) -> std::io::Result<()> {
         show_scores: config.show_scores,
         speaks: config.speaker.is_some(),
         todo_path: config.todo_path,
-        todo_instructions,
+        instructions,
+        ducker: Mutex::new(Ducker::new(music::socket_path(), config.duck_volume)),
     });
     let spawn = |name: &str, f: Box<dyn FnOnce(&Core) + Send>| {
         let core = core.clone();
@@ -1222,6 +1250,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
     spawn("hermes-send", Box::new(send_loop));
     spawn("hermes-weather", Box::new(weather_loop));
     spawn("hermes-todos", Box::new(move |c| todo_loop(c, todo_watcher)));
+    spawn("hermes-duck", Box::new(duck_loop));
     if let Some(speaker) = config.speaker {
         let speaker = Arc::new(speaker);
         spawn("hermes-speak", Box::new(move |c| speak_loop(c, speaker)));
@@ -1267,6 +1296,8 @@ pub fn run(config: Config) -> std::io::Result<()> {
     core.quit.store(true, Ordering::Relaxed);
     core.stop_speech.store(true, Ordering::Relaxed);
     core.changed.notify_all();
+    // Quitting mid-conversation must not leave the music quiet.
+    core.duck(false);
     let run_id = core.lock().run_id.clone();
     if let Some(run_id) = run_id {
         let _ = core.client.stop(&run_id);
@@ -1293,6 +1324,29 @@ mod tests {
         assert_eq!(clock(23, 59), "11:59 PM");
         assert_eq!(parse_weather("+51°F|Overcast \n"), Some(("51°F".into(), "Overcast".into())));
         assert_eq!(parse_weather("location not found: upstream error"), None);
+    }
+
+    #[test]
+    fn engaged_while_awake_or_busy_and_not_while_asleep() {
+        let mut s = Shared { gate: Some(WakeGate::new(Duration::from_secs(8))), ..Shared::default() };
+        s.hearing = true; // room talk, or the music itself, while asleep
+        assert!(!s.engaged());
+        s.gate.as_mut().unwrap().wake();
+        assert!(s.engaged());
+        s.gate.as_mut().unwrap().sleep();
+        s.speaking = true;
+        assert!(s.engaged());
+        s.speaking = false;
+        s.run_id = Some("r".into());
+        assert!(s.engaged());
+    }
+
+    #[test]
+    fn open_mic_is_engaged_only_while_busy() {
+        let mut s = Shared::default(); // no gate
+        assert!(!s.engaged());
+        s.transcribing = true;
+        assert!(s.engaged());
     }
 
     #[test]
