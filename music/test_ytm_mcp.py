@@ -73,9 +73,8 @@ class FakeMpv:
                 stream.write(json.dumps(reply) + "\n")
                 stream.flush()
                 if command == ["quit"]:
-                    # Like mpv, the player takes its socket with it.
+                    # Like mpv, the player stops listening and leaves its socket file behind.
                     server.close()
-                    os.unlink(self.path)
                     return
 
 
@@ -216,7 +215,10 @@ class YtmTest(unittest.TestCase):
             ytm_mcp, "find_song", return_value=("id", "One More Time")
         ):
             _, popen = self.fake_popen(poll=None, on_start=fake.listen)
+            started = time.monotonic()
             self.assertEqual(ytm_mcp.play("one more time"), "Playing One More Time")
+            # The old player's leftover socket file must not hold up the new one.
+            self.assertLess(time.monotonic() - started, 1)
             self.assertIn(["quit"], fake.commands)
             self.assertEqual(popen.call_args.args[0], ytm_mcp.mpv_args(ytm_mcp.mix_url("id"), ytm_mcp.volume))
         self.assertTrue(popen.call_args.kwargs["start_new_session"])

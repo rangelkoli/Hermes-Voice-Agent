@@ -103,17 +103,17 @@ def _control(command: list, done: str) -> str:
 
 
 def _quit_current() -> None:
-    """Stop the running player and wait for its socket to go, so it cannot remove the next one's."""
+    """Stop the running player and wait until it has stopped listening, so two never overlap."""
+    deadline = time.monotonic() + 2
     try:
         send(["quit"])
-    except RuntimeError:
-        pass
-    else:
-        deadline = time.monotonic() + 2
-        while os.path.exists(SOCKET) and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             time.sleep(0.05)
+            send(["get_property", "pid"])
+    except RuntimeError:
+        pass  # nothing is listening any more
     try:
-        os.unlink(SOCKET)  # left behind by a crash
+        os.unlink(SOCKET)  # mpv leaves its socket file behind
     except FileNotFoundError:
         pass
 
